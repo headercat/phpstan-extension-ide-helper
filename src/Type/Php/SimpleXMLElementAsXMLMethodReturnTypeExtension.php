@@ -1,0 +1,39 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\MethodCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Type\BooleanType;
+use PHPStan\Type\Constant\ConstantBooleanType;
+use PHPStan\Type\DynamicMethodReturnTypeExtension;
+use PHPStan\Type\StringType;
+use PHPStan\Type\Type;
+use PHPStan\Type\UnionType;
+use SimpleXMLElement;
+use function count;
+
+final class SimpleXMLElementAsXMLMethodReturnTypeExtension implements DynamicMethodReturnTypeExtension
+{
+
+	public function getClass(): string
+	{
+		return SimpleXMLElement::class;
+	}
+
+	public function isMethodSupported(MethodReflection $methodReflection): bool
+	{
+		return $methodReflection->getName() === 'asXML';
+	}
+
+	public function getTypeFromMethodCall(MethodReflection $methodReflection, MethodCall $methodCall, Scope $scope): Type
+	{
+		if (count($methodCall->getArgs()) === 1) {
+			return new BooleanType();
+		}
+		return new UnionType([new StringType(), new ConstantBooleanType(false)]);
+	}
+
+}
