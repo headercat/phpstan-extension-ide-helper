@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  issue_comment:
+    types: [ created ]
+  workflow_dispatch:
+
+jobs:
+  main:
+    if: (!github.event.issue.number || github.event.issue.number == 1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: main
+          fetch-depth: 0
+          token: ${{ secrets.X_GITHUB_TOKEN }}
+
+      - name: Checkout phpstan/phpstan-src
+        uses: actions/checkout@v4
+        with:
+          repository: phpstan/phpstan-src
+          path: phpstan
+          fetch-depth: 0
+
+      - name: Setup PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.4
+
+      - name: Find uncreated phpstan tag
+        id: uncreated-phpstan-tag
+        run: |
+          cd main
+          php -f scripts/find.php
+
+      - name: Create a new tag
+        if: steps.uncreated-phpstan-tag.outputs.tag != 'none'
+        run: |
+          cd main
+          php -f scripts/create.php ${{ steps.uncreated-phpstan-tag.outputs.tag }}
+
+      - name: Release a new version
+        if: steps.uncreated-phpstan-tag.outputs.tag != 'none'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.uncreated-phpstan-tag.outputs.tag }}
+          name: ${{ steps.uncreated-phpstan-tag.outputs.tag }}
+          body: https://github.com/phpstan/phpstan-src/tree/${{ steps.uncreated-phpstan-tag.outputs.tag }}
+          token: ${{ secrets.X_GITHUB_TOKEN }}
