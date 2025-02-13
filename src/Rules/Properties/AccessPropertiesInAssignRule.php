@@ -1,0 +1,39 @@
+<?php 
+
+namespace PHPStan\Rules\Properties;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\Node\PropertyAssignNode;
+use PHPStan\Rules\Rule;
+
+/**
+ * @implements Rule<PropertyAssignNode>
+ */
+final class AccessPropertiesInAssignRule implements Rule
+{
+
+	public function __construct(private AccessPropertiesCheck $check)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return PropertyAssignNode::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$node->getPropertyFetch() instanceof Node\Expr\PropertyFetch) {
+			return [];
+		}
+
+		if ($node->isAssignOp()) {
+			return [];
+		}
+
+		return $this->check->check($node->getPropertyFetch(), $scope, true);
+	}
+
+}
