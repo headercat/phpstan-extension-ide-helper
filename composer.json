@@ -1,0 +1,5 @@
+{
+  "name": "headercat/phpstan-extension-ide-helper",
+  "description": "PHPStan extension IDE helper, provides dummy PHPStan namespace classes and functions.",
+  "license": "MIT"
+}
