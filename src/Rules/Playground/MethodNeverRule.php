@@ -1,0 +1,53 @@
+<?php 
+
+namespace PHPStan\Rules\Playground;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\Node\MethodReturnStatementsNode;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use function count;
+use function sprintf;
+
+/**
+ * @implements Rule<MethodReturnStatementsNode>
+ */
+final class MethodNeverRule implements Rule
+{
+
+	public function __construct(private NeverRuleHelper $helper)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return MethodReturnStatementsNode::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (count($node->getReturnStatements()) > 0) {
+			return [];
+		}
+
+		$method = $node->getMethodReflection();
+
+		$returnType = $method->getReturnType();
+		$helperResult = $this->helper->shouldReturnNever($node, $returnType);
+		if ($helperResult === false) {
+			return [];
+		}
+
+		return [
+			RuleErrorBuilder::message(sprintf(
+				'Method %s::%s() always %s, it should have return type "never".',
+				$method->getDeclaringClass()->getDisplayName(),
+				$method->getName(),
+				count($helperResult) === 0 ? 'throws an exception' : 'terminates script execution',
+			))->identifier('phpstanPlayground.never')->build(),
+		];
+	}
+
+}
