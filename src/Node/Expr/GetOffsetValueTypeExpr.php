@@ -1,0 +1,40 @@
+<?php 
+
+namespace PHPStan\Node\Expr;
+return;
+
+use PhpParser\Node\Expr;
+use PHPStan\Node\VirtualNode;
+
+final class GetOffsetValueTypeExpr extends Expr implements VirtualNode
+{
+
+	public function __construct(private Expr $var, private Expr $dim)
+	{
+		parent::__construct([]);
+	}
+
+	public function getVar(): Expr
+	{
+		return $this->var;
+	}
+
+	public function getDim(): Expr
+	{
+		return $this->dim;
+	}
+
+	public function getType(): string
+	{
+		return 'PHPStan_Node_GetOffsetValueTypeExpr';
+	}
+
+	/**
+	 * @return string[]
+	 */
+	public function getSubNodeNames(): array
+	{
+		return [];
+	}
+
+}
