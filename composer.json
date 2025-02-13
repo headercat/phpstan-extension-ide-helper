@@ -1,5 +1,15 @@
 {
-  "name": "headercat/phpstan-extension-ide-helper",
-  "description": "PHPStan extension IDE helper, provides dummy PHPStan namespace classes and functions.",
-  "license": "MIT"
+    "name": "headercat/phpstan-extension-ide-helper",
+    "description": "PHPStan extension IDE helper, provides dummy PHPStan namespace classes and functions.",
+    "license": "MIT",
+    "autoload-dev": {
+        "psr-4": {
+            "PHPStan\\": "src/"
+        }
+    },
+    "require": {
+        "phpstan/phpstan": "^1.10.34",
+        "phpstan/php-8-stubs": "0.4.11",
+        "phpstan/phpdoc-parser": "2.0.1"
+    }
 }
