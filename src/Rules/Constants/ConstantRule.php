@@ -1,0 +1,54 @@
+<?php 
+
+namespace PHPStan\Rules\Constants;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use function sprintf;
+
+/**
+ * @implements Rule<Node\Expr\ConstFetch>
+ */
+#[RegisteredRule(level: 1)]
+final class ConstantRule implements Rule
+{
+
+	public function __construct(
+		#[AutowiredParameter(ref: '%tips.discoveringSymbols%')]
+		private bool $discoveringSymbolsTip,
+	)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return Node\Expr\ConstFetch::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$scope->hasConstant($node->name)) {
+			$errorBuilder = RuleErrorBuilder::message(sprintf(
+				'Constant %s not found.',
+				(string) $node->name,
+			))
+				->identifier('constant.notFound');
+
+			if ($this->discoveringSymbolsTip) {
+				$errorBuilder->discoveringSymbolsTip();
+			}
+
+			return [
+				$errorBuilder->build(),
+			];
+		}
+
+		return [];
+	}
+
+}
