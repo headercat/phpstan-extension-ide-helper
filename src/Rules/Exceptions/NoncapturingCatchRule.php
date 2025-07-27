@@ -1,0 +1,45 @@
+<?php 
+
+namespace PHPStan\Rules\Exceptions;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+
+/**
+ * @implements Rule<Node\Stmt\Catch_>
+ */
+#[RegisteredRule(level: 0)]
+final class NoncapturingCatchRule implements Rule
+{
+
+	public function getNodeType(): string
+	{
+		return Node\Stmt\Catch_::class;
+	}
+
+	/**
+	 * @param Node\Stmt\Catch_ $node
+	 */
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if ($scope->getPhpVersion()->supportsNoncapturingCatches()->yes()) {
+			return [];
+		}
+
+		if ($node->var !== null) {
+			return [];
+		}
+
+		return [
+			RuleErrorBuilder::message('Non-capturing catch is supported only on PHP 8.0 and later.')
+				->nonIgnorable()
+				->identifier('catch.nonCapturingNotSupported')
+				->build(),
+		];
+	}
+
+}
