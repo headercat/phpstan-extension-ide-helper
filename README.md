@@ -23,7 +23,9 @@ Or you can manually add into `composer.json`.
 ```
 
 ## Contributing
-If PHPStan release a new version, please write a comment to [Issue #1](https://github.com/headercat/phpstan-extension-ide-helper/issues/1).
+The job creating a new release will be automatically executed every each 30 minutes.
+But if PHPStan release a new version before next 30 minutes iteration occurs, you can write a comment on
+[Issue #1](https://github.com/headercat/phpstan-extension-ide-helper/issues/1) to execute the job manually.
 
 ## How it works?
 1. Clone `phpstan/phpstan-src` repository to `/phpstan`.
