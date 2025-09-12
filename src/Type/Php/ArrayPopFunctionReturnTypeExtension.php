@@ -1,0 +1,44 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\FuncCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\Type\DynamicFunctionReturnTypeExtension;
+use PHPStan\Type\NullType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+
+#[AutowiredService]
+final class ArrayPopFunctionReturnTypeExtension implements DynamicFunctionReturnTypeExtension
+{
+
+	public function isFunctionSupported(FunctionReflection $functionReflection): bool
+	{
+		return $functionReflection->getName() === 'array_pop';
+	}
+
+	public function getTypeFromFunctionCall(FunctionReflection $functionReflection, FuncCall $functionCall, Scope $scope): ?Type
+	{
+		if (!isset($functionCall->getArgs()[0])) {
+			return null;
+		}
+
+		$argType = $scope->getType($functionCall->getArgs()[0]->value);
+		$iterableAtLeastOnce = $argType->isIterableAtLeastOnce();
+		if ($iterableAtLeastOnce->no()) {
+			return new NullType();
+		}
+
+		$itemType = $argType->getLastIterableValueType();
+		if ($iterableAtLeastOnce->yes()) {
+			return $itemType;
+		}
+
+		return TypeCombinator::union($itemType, new NullType());
+	}
+
+}
