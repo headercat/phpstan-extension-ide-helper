@@ -1,0 +1,130 @@
+<?php 
+
+namespace PHPStan\Rules\Classes;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Parser\LastConditionVisitor;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use PHPStan\Rules\RuleLevelHelper;
+use PHPStan\Type\Constant\ConstantBooleanType;
+use PHPStan\Type\ErrorType;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\ObjectWithoutClassType;
+use PHPStan\Type\StringType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use PHPStan\Type\VerbosityLevel;
+use function sprintf;
+
+/**
+ * @implements Rule<Node\Expr\Instanceof_>
+ */
+#[RegisteredRule(level: 4)]
+final class ImpossibleInstanceOfRule implements Rule
+{
+
+	public function __construct(
+		private RuleLevelHelper $ruleLevelHelper,
+		#[AutowiredParameter]
+		private bool $treatPhpDocTypesAsCertain,
+		#[AutowiredParameter]
+		private bool $reportAlwaysTrueInLastCondition,
+		#[AutowiredParameter(ref: '%tips.treatPhpDocTypesAsCertain%')]
+		private bool $treatPhpDocTypesAsCertainTip,
+	)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return Node\Expr\Instanceof_::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if ($node->class instanceof Node\Name) {
+			$className = $scope->resolveName($node->class);
+			$classType = new ObjectType($className);
+		} else {
+			$classType = $this->treatPhpDocTypesAsCertain ? $scope->getType($node->class) : $scope->getNativeType($node->class);
+			$allowed = TypeCombinator::union(
+				new StringType(),
+				new ObjectWithoutClassType(),
+			);
+			$typeResult = $this->ruleLevelHelper->findTypeToCheck(
+				$scope,
+				$node->class,
+				'',
+				static fn (Type $type): bool => !$allowed->isSuperTypeOf($type)->yes(),
+			);
+			if (!$typeResult->getType() instanceof ErrorType && !$allowed->isSuperTypeOf($typeResult->getType())->yes()) {
+				return [
+					RuleErrorBuilder::message(sprintf(
+						'Instanceof between %s and %s results in an error.',
+						$scope->getType($node->expr)->describe(VerbosityLevel::typeOnly()),
+						$classType->describe(VerbosityLevel::typeOnly()),
+					))->identifier('instanceof.invalidExprType')->build(),
+				];
+			}
+		}
+
+		$instanceofType = $this->treatPhpDocTypesAsCertain ? $scope->getType($node) : $scope->getNativeType($node);
+		if (!$instanceofType instanceof ConstantBooleanType) {
+			return [];
+		}
+
+		$addTip = function (RuleErrorBuilder $ruleErrorBuilder) use ($scope, $node): RuleErrorBuilder {
+			if (!$this->treatPhpDocTypesAsCertain) {
+				return $ruleErrorBuilder;
+			}
+
+			$instanceofTypeWithoutPhpDocs = $scope->getNativeType($node);
+			if ($instanceofTypeWithoutPhpDocs instanceof ConstantBooleanType) {
+				return $ruleErrorBuilder;
+			}
+
+			if (!$this->treatPhpDocTypesAsCertainTip) {
+				return $ruleErrorBuilder;
+			}
+
+			return $ruleErrorBuilder->treatPhpDocTypesAsCertainTip();
+		};
+
+		if (!$instanceofType->getValue()) {
+			$exprType = $this->treatPhpDocTypesAsCertain ? $scope->getType($node->expr) : $scope->getNativeType($node->expr);
+
+			return [
+				$addTip(RuleErrorBuilder::message(sprintf(
+					'Instanceof between %s and %s will always evaluate to false.',
+					$exprType->describe(VerbosityLevel::typeOnly()),
+					$classType->describe(VerbosityLevel::getRecommendedLevelByType($classType)),
+				)))->identifier('instanceof.alwaysFalse')->build(),
+			];
+		}
+
+		$isLast = $node->getAttribute(LastConditionVisitor::ATTRIBUTE_NAME);
+		if ($isLast === true && !$this->reportAlwaysTrueInLastCondition) {
+			return [];
+		}
+
+		$exprType = $this->treatPhpDocTypesAsCertain ? $scope->getType($node->expr) : $scope->getNativeType($node->expr);
+		$errorBuilder = $addTip(RuleErrorBuilder::message(sprintf(
+			'Instanceof between %s and %s will always evaluate to true.',
+			$exprType->describe(VerbosityLevel::typeOnly()),
+			$classType->describe(VerbosityLevel::getRecommendedLevelByType($classType)),
+		)));
+		if ($isLast === false && !$this->reportAlwaysTrueInLastCondition) {
+			$errorBuilder->tip('Remove remaining cases below this one and this error will disappear too.');
+		}
+
+		$errorBuilder->identifier('instanceof.alwaysTrue');
+
+		return [$errorBuilder->build()];
+	}
+
+}
