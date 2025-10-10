@@ -1,0 +1,142 @@
+<?php 
+
+namespace PHPStan\Rules\Arrays;
+return;
+
+use PhpParser\Node\Expr;
+use PHPStan\Analyser\NullsafeOperatorHelper;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Rules\IdentifierRuleError;
+use PHPStan\Rules\RuleErrorBuilder;
+use PHPStan\Rules\RuleLevelHelper;
+use PHPStan\Type\BenevolentUnionType;
+use PHPStan\Type\ErrorType;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use PHPStan\Type\TypeUtils;
+use PHPStan\Type\VerbosityLevel;
+use function count;
+use function sprintf;
+
+#[AutowiredService]
+final class NonexistentOffsetInArrayDimFetchCheck
+{
+
+	public function __construct(
+		private RuleLevelHelper $ruleLevelHelper,
+		#[AutowiredParameter]
+		private bool $reportMaybes,
+		#[AutowiredParameter]
+		private bool $reportPossiblyNonexistentGeneralArrayOffset,
+		#[AutowiredParameter]
+		private bool $reportPossiblyNonexistentConstantArrayOffset,
+	)
+	{
+	}
+
+	/**
+	 * @return list<IdentifierRuleError>
+	 */
+	public function check(
+		Scope $scope,
+		Expr $var,
+		string $unknownClassPattern,
+		Type $dimType,
+	): array
+	{
+		$typeResult = $this->ruleLevelHelper->findTypeToCheck(
+			$scope,
+			NullsafeOperatorHelper::getNullsafeShortcircuitedExprRespectingScope($scope, $var),
+			$unknownClassPattern,
+			static fn (Type $type): bool => $type->hasOffsetValueType($dimType)->yes(),
+		);
+		$type = $typeResult->getType();
+		if ($type instanceof ErrorType) {
+			return $typeResult->getUnknownClassErrors();
+		}
+
+		if ($scope->isInExpressionAssign($var) || $scope->isUndefinedExpressionAllowed($var)) {
+			return [];
+		}
+
+		if ($type->hasOffsetValueType($dimType)->no()) {
+			if ($type->isArray()->yes()) {
+				$validArrayDimType = TypeCombinator::intersect(AllowedArrayKeysTypes::getType(), $dimType);
+				if ($validArrayDimType instanceof NeverType) {
+					// Already reported by InvalidKeyInArrayDimFetchRule
+					return [];
+				}
+			}
+
+			return [
+				RuleErrorBuilder::message(sprintf('Offset %s does not exist on %s.', $dimType->describe(count($dimType->getConstantStrings()) > 0 ? VerbosityLevel::precise() : VerbosityLevel::value()), $type->describe(VerbosityLevel::value())))
+					->identifier('offsetAccess.notFound')
+					->build(),
+			];
+		}
+
+		if ($this->reportMaybes) {
+			$report = false;
+
+			if ($type instanceof BenevolentUnionType) {
+				$flattenedTypes = [$type];
+			} else {
+				$flattenedTypes = TypeUtils::flattenTypes($type);
+			}
+
+			$validArrayDimType = $dimType instanceof MixedType
+				? $dimType
+				: TypeCombinator::intersect(AllowedArrayKeysTypes::getType(), $dimType);
+
+			foreach ($flattenedTypes as $innerType) {
+				$dimTypeToCheck = $innerType->isArray()->yes() ? $validArrayDimType : $dimType;
+
+				if (
+					$this->reportPossiblyNonexistentGeneralArrayOffset
+					&& $innerType->isArray()->yes()
+					&& !$innerType->isConstantArray()->yes()
+					&& !$innerType->hasOffsetValueType($dimTypeToCheck)->yes()
+				) {
+					$report = true;
+					break;
+				}
+				if (
+					$this->reportPossiblyNonexistentConstantArrayOffset
+					&& $innerType->isConstantArray()->yes()
+					&& !$innerType->hasOffsetValueType($dimTypeToCheck)->yes()
+				) {
+					$report = true;
+					break;
+				}
+				if ($dimTypeToCheck instanceof BenevolentUnionType) {
+					$flattenedInnerTypes = [$dimTypeToCheck];
+				} else {
+					$flattenedInnerTypes = TypeUtils::flattenTypes($dimTypeToCheck);
+				}
+				foreach ($flattenedInnerTypes as $innerDimType) {
+					if (
+						$innerType->hasOffsetValueType($innerDimType)->no()
+					) {
+						$report = true;
+						break 2;
+					}
+				}
+			}
+
+			if ($report) {
+				return [
+					RuleErrorBuilder::message(sprintf('Offset %s might not exist on %s.', $dimType->describe(count($dimType->getConstantStrings()) > 0 ? VerbosityLevel::precise() : VerbosityLevel::value()), $type->describe(VerbosityLevel::value())))
+						->identifier('offsetAccess.notFound')
+						->build(),
+				];
+			}
+		}
+
+		return [];
+	}
+
+}
