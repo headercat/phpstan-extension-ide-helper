@@ -1,0 +1,70 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PHPStan\Analyser\Generator\GeneratorTypeSpecifier;
+use PHPStan\Analyser\Generator\SpecifiedTypesHelper;
+use PHPStan\Broker\BrokerFactory;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\DependencyInjection\Container;
+use PHPStan\Node\Printer\ExprPrinter;
+use PHPStan\Php\PhpVersion;
+use PHPStan\Reflection\ReflectionProvider;
+use function array_merge;
+
+#[AutowiredService(name: 'typeSpecifierFactory')]
+final class TypeSpecifierFactory
+{
+
+	public const FUNCTION_TYPE_SPECIFYING_EXTENSION_TAG = 'phpstan.typeSpecifier.functionTypeSpecifyingExtension';
+	public const METHOD_TYPE_SPECIFYING_EXTENSION_TAG = 'phpstan.typeSpecifier.methodTypeSpecifyingExtension';
+	public const STATIC_METHOD_TYPE_SPECIFYING_EXTENSION_TAG = 'phpstan.typeSpecifier.staticMethodTypeSpecifyingExtension';
+
+	public function __construct(private Container $container, private bool $gnsr = false)
+	{
+	}
+
+	public function create(): TypeSpecifier
+	{
+		$functionTypeSpecifying = $this->container->getServicesByTag(self::FUNCTION_TYPE_SPECIFYING_EXTENSION_TAG);
+		$methodTypeSpecifying = $this->container->getServicesByTag(self::METHOD_TYPE_SPECIFYING_EXTENSION_TAG);
+		$staticMethodTypeSpecifying = $this->container->getServicesByTag(self::STATIC_METHOD_TYPE_SPECIFYING_EXTENSION_TAG);
+
+		if ($this->gnsr) {
+			$typeSpecifier = new GeneratorTypeSpecifier(
+				$this->container->getByType(SpecifiedTypesHelper::class),
+			);
+		} else {
+			$typeSpecifier = new LegacyTypeSpecifier(
+				$this->container->getByType(ExprPrinter::class),
+				$this->container->getByType(ReflectionProvider::class),
+				$this->container->getByType(PhpVersion::class),
+				$functionTypeSpecifying,
+				$methodTypeSpecifying,
+				$staticMethodTypeSpecifying,
+				$this->container->getParameter('rememberPossiblyImpureFunctionValues'),
+			);
+		}
+
+		foreach (array_merge(
+			$this->container->getServicesByTag(BrokerFactory::PROPERTIES_CLASS_REFLECTION_EXTENSION_TAG),
+			$this->container->getServicesByTag(BrokerFactory::METHODS_CLASS_REFLECTION_EXTENSION_TAG),
+			$this->container->getServicesByTag(BrokerFactory::DYNAMIC_METHOD_RETURN_TYPE_EXTENSION_TAG),
+			$this->container->getServicesByTag(BrokerFactory::DYNAMIC_STATIC_METHOD_RETURN_TYPE_EXTENSION_TAG),
+			$this->container->getServicesByTag(BrokerFactory::DYNAMIC_FUNCTION_RETURN_TYPE_EXTENSION_TAG),
+			$functionTypeSpecifying,
+			$methodTypeSpecifying,
+			$staticMethodTypeSpecifying,
+		) as $extension) {
+			if (!($extension instanceof TypeSpecifierAwareExtension)) {
+				continue;
+			}
+
+			$extension->setTypeSpecifier($typeSpecifier);
+		}
+
+		return $typeSpecifier;
+	}
+
+}
