@@ -1,0 +1,78 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\FuncCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Type\Accessory\NonEmptyArrayType;
+use PHPStan\Type\ArrayType;
+use PHPStan\Type\DynamicFunctionReturnTypeExtension;
+use PHPStan\Type\GeneralizePrecision;
+use PHPStan\Type\IntersectionType;
+use PHPStan\Type\Type;
+use function array_key_exists;
+
+#[AutowiredService]
+final class ArgumentBasedFunctionReturnTypeExtension implements DynamicFunctionReturnTypeExtension
+{
+
+	private const FUNCTION_NAMES = [
+		'array_unique' => 0,
+		'array_diff_assoc' => 0,
+		'array_diff_key' => 0,
+		'array_diff_uassoc' => 0,
+		'array_diff_ukey' => 0,
+		'array_diff' => 0,
+		'array_udiff_assoc' => 0,
+		'array_udiff_uassoc' => 0,
+		'array_udiff' => 0,
+		'array_intersect_assoc' => 0,
+		'array_intersect_uassoc' => 0,
+		'array_intersect_ukey' => 0,
+		'array_intersect' => 0,
+		'array_uintersect_assoc' => 0,
+		'array_uintersect_uassoc' => 0,
+		'array_uintersect' => 0,
+	];
+
+	public function isFunctionSupported(FunctionReflection $functionReflection): bool
+	{
+		return array_key_exists($functionReflection->getName(), self::FUNCTION_NAMES);
+	}
+
+	public function getTypeFromFunctionCall(FunctionReflection $functionReflection, FuncCall $functionCall, Scope $scope): ?Type
+	{
+		if (!array_key_exists($functionReflection->getName(), self::FUNCTION_NAMES)) {
+			throw new ShouldNotHappenException();
+		}
+		$argumentPosition = self::FUNCTION_NAMES[$functionReflection->getName()];
+
+		if (!isset($functionCall->getArgs()[$argumentPosition])) {
+			return null;
+		}
+
+		$argument = $functionCall->getArgs()[$argumentPosition];
+		$argumentType = $scope->getType($argument->value);
+		$argumentKeyType = $argumentType->getIterableKeyType();
+		$argumentValueType = $argumentType->getIterableValueType();
+		if ($argument->unpack) {
+			$argumentKeyType = $argumentKeyType->generalize(GeneralizePrecision::moreSpecific());
+			$argumentValueType = $argumentValueType->getIterableValueType()->generalize(GeneralizePrecision::moreSpecific());
+		}
+
+		$array = new ArrayType(
+			$argumentKeyType,
+			$argumentValueType,
+		);
+		if ($functionReflection->getName() === 'array_unique' && $argumentType->isIterableAtLeastOnce()->yes()) {
+			$array = new IntersectionType([$array, new NonEmptyArrayType()]);
+		}
+
+		return $array;
+	}
+
+}
