@@ -1,0 +1,106 @@
+<?php 
+
+namespace PHPStan\Rules\Comparison;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\Expr\BinaryOp;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Type\Constant\ConstantBooleanType;
+use PHPStan\Type\VerbosityLevel;
+use function get_class;
+use function sprintf;
+
+/**
+ * @implements Rule<Node\Expr\BinaryOp>
+ */
+#[RegisteredRule(level: 4)]
+final class NumberComparisonOperatorsConstantConditionRule implements Rule
+{
+
+	public function __construct(
+		private PossiblyImpureTipHelper $possiblyImpureTipHelper,
+		#[AutowiredParameter]
+		private bool $treatPhpDocTypesAsCertain,
+		#[AutowiredParameter(ref: '%tips.treatPhpDocTypesAsCertain%')]
+		private bool $treatPhpDocTypesAsCertainTip,
+	)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return BinaryOp::class;
+	}
+
+	public function processNode(
+		Node $node,
+		Scope $scope,
+	): array
+	{
+		if (
+			!$node instanceof BinaryOp\Greater
+			&& !$node instanceof BinaryOp\GreaterOrEqual
+			&& !$node instanceof BinaryOp\Smaller
+			&& !$node instanceof BinaryOp\SmallerOrEqual
+		) {
+			return [];
+		}
+
+		$exprType = $this->treatPhpDocTypesAsCertain ? $scope->getType($node) : $scope->getNativeType($node);
+		if ($exprType instanceof ConstantBooleanType) {
+			$addTip = function (RuleErrorBuilder $ruleErrorBuilder) use ($scope, $node): RuleErrorBuilder {
+				if (!$this->treatPhpDocTypesAsCertain) {
+					return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+				}
+
+				$booleanNativeType = $scope->getNativeType($node);
+				if ($booleanNativeType instanceof ConstantBooleanType) {
+					return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+				}
+				if (!$this->treatPhpDocTypesAsCertainTip) {
+					return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+				}
+
+				$ruleErrorBuilder = $ruleErrorBuilder->treatPhpDocTypesAsCertainTip();
+
+				return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+			};
+
+			switch (get_class($node)) {
+				case BinaryOp\Greater::class:
+					$nodeType = 'greater';
+					break;
+				case BinaryOp\GreaterOrEqual::class:
+					$nodeType = 'greaterOrEqual';
+					break;
+				case BinaryOp\Smaller::class:
+					$nodeType = 'smaller';
+					break;
+				case BinaryOp\SmallerOrEqual::class:
+					$nodeType = 'smallerOrEqual';
+					break;
+				default:
+					throw new ShouldNotHappenException();
+			}
+
+			return [
+				$addTip(RuleErrorBuilder::message(sprintf(
+					'Comparison operation "%s" between %s and %s is always %s.',
+					$node->getOperatorSigil(),
+					$scope->getType($node->left)->describe(VerbosityLevel::value()),
+					$scope->getType($node->right)->describe(VerbosityLevel::value()),
+					$exprType->getValue() ? 'true' : 'false',
+				)))->identifier(sprintf('%s.always%s', $nodeType, $exprType->getValue() ? 'True' : 'False'))->build(),
+			];
+		}
+
+		return [];
+	}
+
+}
