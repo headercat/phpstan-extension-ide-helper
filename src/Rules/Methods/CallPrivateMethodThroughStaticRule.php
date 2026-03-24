@@ -1,0 +1,68 @@
+<?php 
+
+namespace PHPStan\Rules\Methods;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Name;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use function sprintf;
+
+/**
+ * @implements Rule<StaticCall>
+ */
+#[RegisteredRule(level: 2)]
+final class CallPrivateMethodThroughStaticRule implements Rule
+{
+
+	public function getNodeType(): string
+	{
+		return StaticCall::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$node->name instanceof Node\Identifier) {
+			return [];
+		}
+		if (!$node->class instanceof Name) {
+			return [];
+		}
+
+		$methodName = $node->name->name;
+		$className = $node->class;
+		if ($className->toLowerString() !== 'static') {
+			return [];
+		}
+
+		if ($scope->isInClass() && $scope->getClassReflection()->isFinal()) {
+			return [];
+		}
+
+		$classType = $scope->resolveTypeByName($className);
+		if (!$classType->hasMethod($methodName)->yes()) {
+			return [];
+		}
+
+		$method = $classType->getMethod($methodName, $scope);
+		if (!$method->isPrivate()) {
+			return [];
+		}
+
+		return [
+			RuleErrorBuilder::message(sprintf(
+				'Unsafe call to private method %s::%s() through static::.',
+				$method->getDeclaringClass()->getDisplayName(),
+				$method->getName(),
+			))
+				->line($node->name->getStartLine())
+				->identifier('staticClassAccess.privateMethod')
+				->build(),
+		];
+	}
+
+}
