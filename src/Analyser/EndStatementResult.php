@@ -1,0 +1,31 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PhpParser\Node\Stmt;
+
+/**
+ * @api
+ */
+final class EndStatementResult
+{
+
+	public function __construct(
+		private Stmt $statement,
+		private StatementResult $result,
+	)
+	{
+	}
+
+	public function getStatement(): Stmt
+	{
+		return $this->statement;
+	}
+
+	public function getResult(): StatementResult
+	{
+		return $this->result;
+	}
+
+}
