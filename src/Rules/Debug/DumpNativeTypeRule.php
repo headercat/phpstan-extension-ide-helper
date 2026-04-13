@@ -1,0 +1,66 @@
+<?php 
+
+namespace PHPStan\Rules\Debug;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use PHPStan\Type\VerbosityLevel;
+use function count;
+use function sprintf;
+use function strtolower;
+
+/**
+ * @implements Rule<Node\Expr\FuncCall>
+ */
+#[AutowiredService]
+final class DumpNativeTypeRule implements Rule
+{
+
+	public function __construct(private ReflectionProvider $reflectionProvider)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return Node\Expr\FuncCall::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$node->name instanceof Node\Name) {
+			return [];
+		}
+
+		$args = $node->getArgs();
+		if (count($args) === 0) {
+			return [];
+		}
+
+		$functionName = $this->reflectionProvider->resolveFunctionName($node->name, $scope);
+		if ($functionName === null) {
+			return [];
+		}
+
+		if (strtolower($functionName) !== 'phpstan\dumpnativetype') {
+			return [];
+		}
+
+		$errors = [];
+		foreach ($args as $arg) {
+			$errors[] = RuleErrorBuilder::message(
+				sprintf(
+					'Dumped type: %s',
+					$scope->getNativeType($arg->value)->describe(VerbosityLevel::precise()),
+				),
+			)->nonIgnorable()->identifier('phpstan.dumpNativeType')->build();
+		}
+
+		return $errors;
+	}
+
+}
