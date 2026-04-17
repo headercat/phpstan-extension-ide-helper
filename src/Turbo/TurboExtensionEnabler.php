@@ -1,0 +1,27 @@
+<?php 
+
+namespace PHPStan\Turbo;
+return;
+
+use PHPStan\Internal\CombinationsHelper;
+use function class_alias;
+use function extension_loaded;
+
+final class TurboExtensionEnabler
+{
+
+	public static function isLoaded(): bool
+	{
+		return extension_loaded('phpstanturbo');
+	}
+
+	public static function enableIfLoaded(): void
+	{
+		if (!self::isLoaded()) {
+			return;
+		}
+
+		class_alias('PHPStanTurbo\CombinationsHelper', CombinationsHelper::class);
+	}
+
+}
