@@ -1,0 +1,38 @@
+<?php 
+
+namespace PHPStan\Rules\EnumCases;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+
+/**
+ * @implements Rule<Node\Stmt\EnumCase>
+ */
+#[RegisteredRule(level: 0)]
+final class EnumCaseOutsideEnumRule implements Rule
+{
+
+	public function getNodeType(): string
+	{
+		return Node\Stmt\EnumCase::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$scope->isInTrait() && $scope->isInClass() && $scope->getClassReflection()->isEnum()) {
+			return [];
+		}
+
+		return [
+			RuleErrorBuilder::message('Enum case can only be used in enums.')
+				->nonIgnorable()
+				->identifier('enum.caseOutsideOfEnum')
+				->build(),
+		];
+	}
+
+}

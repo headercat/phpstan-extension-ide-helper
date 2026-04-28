@@ -1,0 +1,114 @@
+<?php 
+
+namespace PHPStan\Rules\Comparison;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\CollectedDataEmitter;
+use PHPStan\Analyser\NodeCallbackInvoker;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Parser\LastConditionVisitor;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use function sprintf;
+
+/**
+ * @implements Rule<Node\Expr\FuncCall>
+ */
+#[RegisteredRule(level: 4)]
+final class ImpossibleCheckTypeFunctionCallRule implements Rule
+{
+
+	public function __construct(
+		private ImpossibleCheckTypeHelper $impossibleCheckTypeHelper,
+		private PossiblyImpureTipHelper $possiblyImpureTipHelper,
+		private ConstantConditionInTraitHelper $constantConditionInTraitHelper,
+		#[AutowiredParameter]
+		private bool $treatPhpDocTypesAsCertain,
+		#[AutowiredParameter]
+		private bool $reportAlwaysTrueInLastCondition,
+		#[AutowiredParameter(ref: '%tips.treatPhpDocTypesAsCertain%')]
+		private bool $treatPhpDocTypesAsCertainTip,
+	)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return Node\Expr\FuncCall::class;
+	}
+
+	public function processNode(Node $node, Scope&NodeCallbackInvoker&CollectedDataEmitter $scope): array
+	{
+		if (!$node->name instanceof Node\Name) {
+			return [];
+		}
+
+		$functionName = (string) $node->name;
+		$isAlways = $this->impossibleCheckTypeHelper->findSpecifiedType($scope, $node);
+		if ($isAlways === null) {
+			$this->constantConditionInTraitHelper->emitNoError(self::class, $scope, $node);
+			return [];
+		}
+
+		$addTip = function (RuleErrorBuilder $ruleErrorBuilder) use ($scope, $node): RuleErrorBuilder {
+			if (!$this->treatPhpDocTypesAsCertain) {
+				return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+			}
+
+			$isAlways = $this->impossibleCheckTypeHelper->doNotTreatPhpDocTypesAsCertain()->findSpecifiedType($scope, $node);
+			if ($isAlways !== null) {
+				return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+			}
+			if (!$this->treatPhpDocTypesAsCertainTip) {
+				return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+			}
+
+			$ruleErrorBuilder = $ruleErrorBuilder->treatPhpDocTypesAsCertainTip();
+
+			return $this->possiblyImpureTipHelper->addTip($scope, $node, $ruleErrorBuilder);
+		};
+
+		if (!$isAlways) {
+			$ruleError = $addTip(RuleErrorBuilder::message(sprintf(
+				'Call to function %s()%s will always evaluate to false.',
+				$functionName,
+				$this->impossibleCheckTypeHelper->getArgumentsDescription($scope, $node->getArgs()),
+			)))->identifier('function.impossibleType')->build();
+			if ($scope->isInTrait()) {
+				$this->constantConditionInTraitHelper->emitError(self::class, $scope, $node, false, $ruleError);
+				return [];
+			}
+
+			return [$ruleError];
+		}
+
+		$isLast = $node->getAttribute(LastConditionVisitor::ATTRIBUTE_NAME);
+		if ($isLast === true && !$this->reportAlwaysTrueInLastCondition) {
+			$this->constantConditionInTraitHelper->emitNoError(self::class, $scope, $node);
+			return [];
+		}
+
+		$errorBuilder = $addTip(RuleErrorBuilder::message(sprintf(
+			'Call to function %s()%s will always evaluate to true.',
+			$functionName,
+			$this->impossibleCheckTypeHelper->getArgumentsDescription($scope, $node->getArgs()),
+		)));
+		if ($isLast === false && !$this->reportAlwaysTrueInLastCondition) {
+			$errorBuilder->tip('Remove remaining cases below this one and this error will disappear too.');
+		}
+
+		$errorBuilder->identifier('function.alreadyNarrowedType');
+
+		$ruleError = $errorBuilder->build();
+		if ($scope->isInTrait()) {
+			$this->constantConditionInTraitHelper->emitError(self::class, $scope, $node, true, $ruleError);
+			return [];
+		}
+
+		return [$ruleError];
+	}
+
+}
