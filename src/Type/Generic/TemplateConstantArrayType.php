@@ -1,0 +1,58 @@
+<?php 
+
+namespace PHPStan\Type\Generic;
+return;
+
+use PHPStan\TrinaryLogic;
+use PHPStan\Type\Constant\ConstantArrayType;
+use PHPStan\Type\Traits\UndecidedComparisonCompoundTypeTrait;
+use PHPStan\Type\Type;
+
+/** @api */
+final class TemplateConstantArrayType extends ConstantArrayType implements TemplateType
+{
+
+	/** @use TemplateTypeTrait<ConstantArrayType> */
+	use TemplateTypeTrait;
+	use UndecidedComparisonCompoundTypeTrait;
+
+	/**
+	 * @param non-empty-string $name
+	 */
+	public function __construct(
+		TemplateTypeScope $scope,
+		TemplateTypeStrategy $templateTypeStrategy,
+		TemplateTypeVariance $templateTypeVariance,
+		string $name,
+		ConstantArrayType $bound,
+		?Type $default,
+	)
+	{
+		parent::__construct($bound->getKeyTypes(), $bound->getValueTypes(), $bound->getNextAutoIndexes(), $bound->getOptionalKeys(), $bound->isList());
+		$this->scope = $scope;
+		$this->strategy = $templateTypeStrategy;
+		$this->variance = $templateTypeVariance;
+		$this->name = $name;
+		$this->bound = $bound;
+		$this->default = $default;
+	}
+
+	protected function recreate(
+		array $keyTypes,
+		array $valueTypes,
+		array $nextAutoIndexes = [0],
+		array $optionalKeys = [],
+		?TrinaryLogic $isList = null,
+	): ConstantArrayType
+	{
+		return new self(
+			$this->scope,
+			$this->strategy,
+			$this->variance,
+			$this->name,
+			new ConstantArrayType($keyTypes, $valueTypes, $nextAutoIndexes, $optionalKeys, $isList),
+			$this->default,
+		);
+	}
+
+}
