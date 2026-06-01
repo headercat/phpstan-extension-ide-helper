@@ -1,0 +1,88 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use DatePeriod;
+use DateTime;
+use DateTimeInterface;
+use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Name;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Type\DynamicStaticMethodReturnTypeExtension;
+use PHPStan\Type\Generic\GenericObjectType;
+use PHPStan\Type\IntegerType;
+use PHPStan\Type\NullType;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\Type;
+use function strtolower;
+
+#[AutowiredService]
+final class DatePeriodConstructorReturnTypeExtension implements DynamicStaticMethodReturnTypeExtension
+{
+
+	public function getClass(): string
+	{
+		return DatePeriod::class;
+	}
+
+	public function isStaticMethodSupported(MethodReflection $methodReflection): bool
+	{
+		return $methodReflection->getName() === '__construct';
+	}
+
+	public function getTypeFromStaticMethodCall(MethodReflection $methodReflection, StaticCall $methodCall, Scope $scope): ?Type
+	{
+		if (!$methodCall->class instanceof Name) {
+			return null;
+		}
+
+		$className = $scope->resolveName($methodCall->class);
+		if (strtolower($className) !== 'dateperiod') {
+			return null;
+		}
+
+		$args = $methodCall->getArgs();
+		if (!isset($args[0])) {
+			return null;
+		}
+
+		$firstArgType = $scope->getType($args[0]->value);
+		if ($firstArgType->isString()->yes()) {
+			$firstArgType = new ObjectType(DateTime::class);
+		}
+		$thirdArgType = null;
+		if (isset($args[2])) {
+			$thirdArgType = $scope->getType($args[2]->value);
+		}
+
+		if (!$thirdArgType instanceof Type) {
+			return new GenericObjectType(DatePeriod::class, [
+				$firstArgType,
+				new NullType(),
+				new IntegerType(),
+			]);
+		}
+
+		if ((new ObjectType(DateTimeInterface::class))->isSuperTypeOf($thirdArgType)->yes()) {
+			return new GenericObjectType(DatePeriod::class, [
+				$firstArgType,
+				$thirdArgType,
+				new NullType(),
+			]);
+		}
+
+		if ($thirdArgType->isInteger()->yes()) {
+			return new GenericObjectType(DatePeriod::class, [
+				$firstArgType,
+				new NullType(),
+				$thirdArgType,
+			]);
+		}
+
+		return null;
+	}
+
+}
