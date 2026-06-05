@@ -1,0 +1,106 @@
+<?php 
+
+namespace PHPStan\Analyser\ExprHandler;
+return;
+
+use PhpParser\Node\Expr;
+use PhpParser\Node\Expr\BinaryOp\NotIdentical;
+use PhpParser\Node\Expr\ConstFetch;
+use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\NullsafeMethodCall;
+use PhpParser\Node\Name;
+use PhpParser\Node\Stmt;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\ExpressionResult;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\ExprHandler;
+use PHPStan\Analyser\ExprHandler\Helper\NonNullabilityHelper;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Node\Printer\ExprPrinter;
+use PHPStan\Type\NullType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use function array_merge;
+
+/**
+ * @implements ExprHandler<NullsafeMethodCall>
+ */
+#[AutowiredService]
+final class NullsafeMethodCallHandler implements ExprHandler
+{
+
+	public function __construct(
+		private NonNullabilityHelper $nonNullabilityHelper,
+	)
+	{
+	}
+
+	public function supports(Expr $expr): bool
+	{
+		return $expr instanceof NullsafeMethodCall;
+	}
+
+	public function resolveType(MutatingScope $scope, Expr $expr): Type
+	{
+		$varType = $scope->getType($expr->var);
+		if ($varType->isNull()->yes()) {
+			return new NullType();
+		}
+		if (!TypeCombinator::containsNull($varType)) {
+			return $scope->getType(new MethodCall($expr->var, $expr->name, $expr->args));
+		}
+
+		return TypeCombinator::union(
+			$scope->filterByTruthyValue(new NotIdentical($expr->var, new ConstFetch(new Name('null'))))
+				->getType(new MethodCall($expr->var, $expr->name, $expr->args)),
+			new NullType(),
+		);
+	}
+
+	public function processExpr(NodeScopeResolver $nodeScopeResolver, Stmt $stmt, Expr $expr, MutatingScope $scope, ExpressionResultStorage $storage, callable $nodeCallback, ExpressionContext $context): ExpressionResult
+	{
+		$scopeBeforeNullsafe = $scope;
+		$varType = $scope->getType($expr->var);
+
+		$nonNullabilityResult = $this->nonNullabilityHelper->ensureShallowNonNullability($scope, $scope, $expr->var);
+		$attributes = array_merge($expr->getAttributes(), ['virtualNullsafeMethodCall' => true]);
+		unset($attributes[ExprPrinter::ATTRIBUTE_CACHE_KEY]);
+		$exprResult = $nodeScopeResolver->processExprNode(
+			$stmt,
+			new MethodCall(
+				$expr->var,
+				$expr->name,
+				$expr->args,
+				$attributes,
+			),
+			$nonNullabilityResult->getScope(),
+			$storage,
+			$nodeCallback,
+			$context,
+		);
+		$scope = $this->nonNullabilityHelper->revertNonNullability($exprResult->getScope(), $nonNullabilityResult->getSpecifiedExpressions());
+
+		$varIsNull = $varType->isNull();
+		if ($varIsNull->yes()) {
+			// Arguments are never evaluated when the var is always null.
+			$scope = $scopeBeforeNullsafe;
+		} elseif ($varIsNull->maybe()) {
+			// Arguments might not be evaluated (short-circuit).
+			// Merge with the original scope so variables assigned in arguments become "maybe defined".
+			$scope = $scope->mergeWith($scopeBeforeNullsafe);
+		}
+
+		return new ExpressionResult(
+			$scope,
+			hasYield: $exprResult->hasYield(),
+			isAlwaysTerminating: false,
+			throwPoints: $exprResult->getThrowPoints(),
+			impurePoints: $exprResult->getImpurePoints(),
+			truthyScopeCallback: static fn (): MutatingScope => $scope->filterByTruthyValue($expr),
+			falseyScopeCallback: static fn (): MutatingScope => $scope->filterByFalseyValue($expr),
+		);
+	}
+
+}
