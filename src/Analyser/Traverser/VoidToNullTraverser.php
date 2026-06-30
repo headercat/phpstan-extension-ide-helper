@@ -1,0 +1,30 @@
+<?php 
+
+namespace PHPStan\Analyser\Traverser;
+return;
+
+use PHPStan\Type\NullType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeTraverserCallable;
+use PHPStan\Type\UnionType;
+
+final class VoidToNullTraverser implements TypeTraverserCallable
+{
+
+	/**
+	 * @param callable(Type): Type $traverse
+	 */
+	public function traverse(Type $type, callable $traverse): Type
+	{
+		if ($type instanceof UnionType) {
+			return $traverse($type);
+		}
+
+		if ($type->isVoid()->yes()) {
+			return new NullType();
+		}
+
+		return $type;
+	}
+
+}
