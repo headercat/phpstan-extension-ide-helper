@@ -1,0 +1,35 @@
+<?php 
+
+namespace PHPStan\Internal;
+return;
+
+use Traversable;
+use function array_pop;
+
+final class CombinationsHelper
+{
+
+	/**
+	 * @param array<iterable<mixed>> $arrays
+	 * @return Traversable<list<mixed>>
+	 */
+	public static function combinations(array $arrays): iterable
+	{
+		// from https://stackoverflow.com/a/70800936/565782 by Arnaud Le Blanc
+		if ($arrays === []) {
+			yield [];
+			return;
+		}
+
+		$last = array_pop($arrays);
+
+		foreach (self::combinations($arrays) as $combination) {
+			foreach ($last as $elem) {
+				$comb = $combination;
+				$comb[] = $elem;
+				yield $comb;
+			}
+		}
+	}
+
+}
