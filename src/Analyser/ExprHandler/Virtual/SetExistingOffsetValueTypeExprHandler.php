@@ -1,0 +1,71 @@
+<?php 
+
+namespace PHPStan\Analyser\ExprHandler\Virtual;
+return;
+
+use PhpParser\Node\Expr;
+use PhpParser\Node\Stmt;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\ExpressionResult;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\ExprHandler;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\Scope;
+use PHPStan\Analyser\SpecifiedTypes;
+use PHPStan\Analyser\TypeSpecifier;
+use PHPStan\Analyser\TypeSpecifierContext;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Node\Expr\OriginalPropertyTypeExpr;
+use PHPStan\Node\Expr\SetExistingOffsetValueTypeExpr;
+use PHPStan\Type\Type;
+use PHPStan\Type\UnionType;
+
+/**
+ * @implements ExprHandler<SetExistingOffsetValueTypeExpr>
+ */
+#[AutowiredService]
+final class SetExistingOffsetValueTypeExprHandler implements ExprHandler
+{
+
+	public function supports(Expr $expr): bool
+	{
+		return $expr instanceof SetExistingOffsetValueTypeExpr;
+	}
+
+	public function processExpr(NodeScopeResolver $nodeScopeResolver, Stmt $stmt, Expr $expr, MutatingScope $scope, ExpressionResultStorage $storage, callable $nodeCallback, ExpressionContext $context): ExpressionResult
+	{
+		// because this is a virtual node handler, the caller will only be interested in the type
+		// we don't need to process the inner expr
+
+		return new ExpressionResult(
+			$scope,
+			hasYield: false,
+			isAlwaysTerminating: false,
+			throwPoints: [],
+			impurePoints: [],
+		);
+	}
+
+	public function resolveType(MutatingScope $scope, Expr $expr): Type
+	{
+		$varNode = $expr->getVar();
+		$varType = $scope->getType($varNode);
+		if ($varNode instanceof OriginalPropertyTypeExpr) {
+			$currentPropertyType = $scope->getType($varNode->getPropertyFetch());
+			if ($varType instanceof UnionType) {
+				$varType = $varType->filterTypes(static fn (Type $innerType) => !$innerType->isSuperTypeOf($currentPropertyType)->no());
+			}
+		}
+		return $varType->setExistingOffsetValueType(
+			$scope->getType($expr->getDim()),
+			$scope->getType($expr->getValue()),
+		);
+	}
+
+	public function specifyTypes(TypeSpecifier $typeSpecifier, Scope $scope, Expr $expr, TypeSpecifierContext $context): SpecifiedTypes
+	{
+		return $typeSpecifier->specifyDefaultTypes($scope, $expr, $context);
+	}
+
+}
