@@ -1,0 +1,53 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\FuncCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\Type\DynamicFunctionReturnTypeExtension;
+use PHPStan\Type\NullType;
+use PHPStan\Type\Type;
+use function count;
+
+#[AutowiredService]
+final class ArrayColumnFunctionReturnTypeExtension implements DynamicFunctionReturnTypeExtension
+{
+
+	public function __construct(
+		private ArrayColumnHelper $arrayColumnHelper,
+	)
+	{
+	}
+
+	public function isFunctionSupported(FunctionReflection $functionReflection): bool
+	{
+		return $functionReflection->getName() === 'array_column';
+	}
+
+	public function getTypeFromFunctionCall(FunctionReflection $functionReflection, FuncCall $functionCall, Scope $scope): ?Type
+	{
+		$args = $functionCall->getArgs();
+		$numArgs = count($args);
+		if ($numArgs < 2) {
+			return null;
+		}
+
+		$arrayType = $scope->getType($args[0]->value);
+		$columnType = $scope->getType($args[1]->value);
+		$indexType = $numArgs >= 3 ? $scope->getType($args[2]->value) : new NullType();
+
+		$constantArrayTypes = $arrayType->getConstantArrays();
+		if (count($constantArrayTypes) === 1) {
+			$type = $this->arrayColumnHelper->handleConstantArray($constantArrayTypes[0], $columnType, $indexType, $scope);
+			if ($type !== null) {
+				return $type;
+			}
+		}
+
+		return $this->arrayColumnHelper->handleAnyArray($arrayType, $columnType, $indexType, $scope);
+	}
+
+}
