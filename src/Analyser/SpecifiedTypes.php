@@ -1,0 +1,365 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PhpParser\Node\Expr;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use function array_key_exists;
+use function array_merge;
+
+final class SpecifiedTypes
+{
+
+	private bool $overwrite = false;
+
+	/** @var array<string, ConditionalExpressionHolder[]> */
+	private array $newConditionalExpressionHolders = [];
+
+	private ?Expr $rootExpr = null;
+
+	/**
+	 * Alternative-form entries produced by intersectWith() when the two sides
+	 * constrain the same expression with different kinds (a sure type in one
+	 * branch, a sure-not in the other). Each term (sure, subtract) reads as
+	 * `(sure ?? current type) minus subtract`; the entry's value is the union
+	 * of its terms, evaluated by MutatingScope::applySpecifiedTypes() against
+	 * the subject's type at the application point - the deferred form of what
+	 * the old SpecifiedTypes::normalize() computed eagerly with a scope.
+	 *
+	 * @var array<string, array{Expr, list<array{?Type, ?Type}>}>
+	 */
+	private array $alternativeTypes = [];
+
+	/**
+	 * @api
+	 * @param array<string, array{Expr, Type}> $sureTypes
+	 * @param array<string, array{Expr, Type}> $sureNotTypes
+	 */
+	public function __construct(
+		private array $sureTypes = [],
+		private array $sureNotTypes = [],
+	)
+	{
+	}
+
+	/**
+	 * Normally, $sureTypes in truthy context are used to intersect with the pre-existing type.
+	 * And $sureNotTypes are used to remove type from the pre-existing type.
+	 *
+	 * Example: By default, non-empty-string intersected with '' (ConstantStringType) will lead to NeverType.
+	 * Because it's not possible to narrow non-empty-string to an empty string.
+	 *
+	 * In rare cases, a type-specifying extension might want to overwrite the pre-existing types
+	 * without taking the pre-existing types into consideration.
+	 *
+	 * In that case it should also call setAlwaysOverwriteTypes() on
+	 * the returned object.
+	 *
+	 * ! Only do this if you're certain. Otherwise, this is a source of common bugs. !
+	 *
+	 * @api
+	 */
+	public function setAlwaysOverwriteTypes(): self
+	{
+		$self = new self($this->sureTypes, $this->sureNotTypes);
+		$self->alternativeTypes = $this->alternativeTypes;
+		$self->overwrite = true;
+		$self->newConditionalExpressionHolders = $this->newConditionalExpressionHolders;
+		$self->rootExpr = $this->rootExpr;
+
+		return $self;
+	}
+
+	/**
+	 * @api
+	 */
+	public function setRootExpr(?Expr $rootExpr): self
+	{
+		$self = new self($this->sureTypes, $this->sureNotTypes);
+		$self->alternativeTypes = $this->alternativeTypes;
+		$self->overwrite = $this->overwrite;
+		$self->newConditionalExpressionHolders = $this->newConditionalExpressionHolders;
+		$self->rootExpr = $rootExpr;
+
+		return $self;
+	}
+
+	/**
+	 * @param array<string, ConditionalExpressionHolder[]> $newConditionalExpressionHolders
+	 */
+	public function setNewConditionalExpressionHolders(array $newConditionalExpressionHolders): self
+	{
+		$self = new self($this->sureTypes, $this->sureNotTypes);
+		$self->alternativeTypes = $this->alternativeTypes;
+		$self->overwrite = $this->overwrite;
+		$self->newConditionalExpressionHolders = $newConditionalExpressionHolders;
+		$self->rootExpr = $this->rootExpr;
+
+		return $self;
+	}
+
+	/**
+	 * @api
+	 * @return array<string, array{Expr, Type}>
+	 */
+	public function getSureTypes(): array
+	{
+		return $this->sureTypes;
+	}
+
+	/**
+	 * @api
+	 * @return array<string, array{Expr, Type}>
+	 */
+	public function getSureNotTypes(): array
+	{
+		return $this->sureNotTypes;
+	}
+
+	/**
+	 * @return array<string, array{Expr, list<array{?Type, ?Type}>}>
+	 */
+	public function getAlternativeTypes(): array
+	{
+		return $this->alternativeTypes;
+	}
+
+	/**
+	 * A copy of this with the other's alternative-form entries - for the
+	 * composition tails that rebuild a SpecifiedTypes from the sure/sure-not
+	 * slots and must not drop the merged alternatives.
+	 */
+	public function withAlternativeTypesOf(self $other): self
+	{
+		$self = new self($this->sureTypes, $this->sureNotTypes);
+		$self->alternativeTypes = $other->alternativeTypes;
+		$self->overwrite = $this->overwrite;
+		$self->newConditionalExpressionHolders = $this->newConditionalExpressionHolders;
+		$self->rootExpr = $this->rootExpr;
+
+		return $self;
+	}
+
+	public function shouldOverwrite(): bool
+	{
+		return $this->overwrite;
+	}
+
+	/**
+	 * @return array<string, ConditionalExpressionHolder[]>
+	 */
+	public function getNewConditionalExpressionHolders(): array
+	{
+		return $this->newConditionalExpressionHolders;
+	}
+
+	public function getRootExpr(): ?Expr
+	{
+		return $this->rootExpr;
+	}
+
+	public function removeExpr(string $exprString): self
+	{
+		$sureTypes = $this->sureTypes;
+		$sureNotTypes = $this->sureNotTypes;
+		$alternativeTypes = $this->alternativeTypes;
+		unset($sureTypes[$exprString]);
+		unset($sureNotTypes[$exprString]);
+		unset($alternativeTypes[$exprString]);
+
+		$self = new self($sureTypes, $sureNotTypes);
+		$self->alternativeTypes = $alternativeTypes;
+		$self->overwrite = $this->overwrite;
+		$self->newConditionalExpressionHolders = $this->newConditionalExpressionHolders;
+		$self->rootExpr = $this->rootExpr;
+
+		return $self;
+	}
+
+	/**
+	 * The either-branch merge: the result holds when at least one side holds
+	 * (the falsey narrowing of `&&`, the truthy narrowing of `||`). Same-kind
+	 * constraints merge exactly (sure: union of values, sure-not: intersection
+	 * of removed types); an expression constrained with different kinds on the
+	 * two sides becomes an alternative-form entry - `(sure ?? current) minus
+	 * subtract` per side, united at the application point. An expression
+	 * constrained on only one side is unconstrained in the merge.
+	 *
+	 * @api
+	 */
+	public function intersectWith(SpecifiedTypes $other): self
+	{
+		$sureTypeUnion = [];
+		$sureNotTypeUnion = [];
+		$alternativeUnion = [];
+		$rootExpr = $this->mergeRootExpr($this->rootExpr, $other->rootExpr);
+
+		$keys = [];
+		foreach ([$this->sureTypes, $this->sureNotTypes, $this->alternativeTypes, $other->sureTypes, $other->sureNotTypes, $other->alternativeTypes] as $map) {
+			foreach ($map as $exprString => $entry) {
+				$keys[$exprString] = $entry[0];
+			}
+		}
+
+		foreach ($keys as $exprString => $exprNode) {
+			$thisTerms = $this->collectTerms($exprString);
+			$otherTerms = $other->collectTerms($exprString);
+			if ($thisTerms === null || $otherTerms === null) {
+				// unconstrained on one side - unconstrained in the merge
+				continue;
+			}
+
+			$terms = array_merge($thisTerms, $otherTerms);
+			$sures = [];
+			$subtracts = [];
+			$pureSure = true;
+			$pureSureNot = true;
+			foreach ($terms as [$sure, $subtract]) {
+				if ($sure === null) {
+					$pureSure = false;
+				} else {
+					$sures[] = $sure;
+				}
+				if ($subtract === null) {
+					$pureSureNot = false;
+				} else {
+					$subtracts[] = $subtract;
+				}
+				if ($sure === null || $subtract === null) {
+					continue;
+				}
+
+				$pureSure = false;
+				$pureSureNot = false;
+			}
+
+			if ($pureSure) {
+				$sureTypeUnion[$exprString] = [$exprNode, TypeCombinator::union(...$sures)];
+			} elseif ($pureSureNot) {
+				$merged = TypeCombinator::intersect(...$subtracts);
+				if ($merged instanceof NeverType) {
+					// removing never removes nothing - a vacuous constraint
+					continue;
+				}
+				$sureNotTypeUnion[$exprString] = [$exprNode, $merged];
+			} else {
+				$alternativeUnion[$exprString] = [$exprNode, $terms];
+			}
+		}
+
+		$result = new self($sureTypeUnion, $sureNotTypeUnion);
+		$result->alternativeTypes = $alternativeUnion;
+		if ($this->overwrite && $other->overwrite) {
+			$result = $result->setAlwaysOverwriteTypes();
+		}
+
+		return $result->setRootExpr($rootExpr);
+	}
+
+	/**
+	 * This side's constraint on the expression as alternative-form terms, or
+	 * null when unconstrained. A sure and a sure-not on the same key are one
+	 * term (the sure with the sure-not removed) - both constraints hold here.
+	 *
+	 * @return list<array{?Type, ?Type}>|null
+	 */
+	private function collectTerms(string|int $exprString): ?array
+	{
+		if (isset($this->alternativeTypes[$exprString])) {
+			$terms = $this->alternativeTypes[$exprString][1];
+			// sure/sureNot on the same key as an alternative entry: fold them
+			// into every term (they hold in addition to the alternatives)
+			if (isset($this->sureTypes[$exprString]) || isset($this->sureNotTypes[$exprString])) {
+				$extraSure = $this->sureTypes[$exprString][1] ?? null;
+				$extraSubtract = $this->sureNotTypes[$exprString][1] ?? null;
+				$folded = [];
+				foreach ($terms as [$sure, $subtract]) {
+					if ($extraSure !== null) {
+						$sure = $sure === null ? $extraSure : TypeCombinator::intersect($sure, $extraSure);
+					}
+					if ($extraSubtract !== null) {
+						$subtract = $subtract === null ? $extraSubtract : TypeCombinator::union($subtract, $extraSubtract);
+					}
+					$folded[] = [$sure, $subtract];
+				}
+
+				return $folded;
+			}
+
+			return $terms;
+		}
+
+		$sure = $this->sureTypes[$exprString][1] ?? null;
+		$subtract = $this->sureNotTypes[$exprString][1] ?? null;
+		if ($sure === null && $subtract === null) {
+			return null;
+		}
+
+		return [[$sure, $subtract]];
+	}
+
+	/** @api */
+	public function unionWith(SpecifiedTypes $other): self
+	{
+		$sureTypeUnion = $this->sureTypes + $other->sureTypes;
+		$sureNotTypeUnion = $this->sureNotTypes + $other->sureNotTypes;
+		$rootExpr = $this->mergeRootExpr($this->rootExpr, $other->rootExpr);
+
+		foreach ($this->sureTypes as $exprString => [$exprNode, $type]) {
+			if (!isset($other->sureTypes[$exprString])) {
+				continue;
+			}
+
+			$sureTypeUnion[$exprString] = [
+				$exprNode,
+				TypeCombinator::intersect($type, $other->sureTypes[$exprString][1]),
+			];
+		}
+
+		foreach ($this->sureNotTypes as $exprString => [$exprNode, $type]) {
+			if (!isset($other->sureNotTypes[$exprString])) {
+				continue;
+			}
+
+			$sureNotTypeUnion[$exprString] = [
+				$exprNode,
+				TypeCombinator::union($type, $other->sureNotTypes[$exprString][1]),
+			];
+		}
+
+		$result = new self($sureTypeUnion, $sureNotTypeUnion);
+		$result->alternativeTypes = $this->alternativeTypes + $other->alternativeTypes;
+		if ($this->overwrite || $other->overwrite) {
+			$result = $result->setAlwaysOverwriteTypes();
+		}
+
+		$conditionalExpressionHolders = $this->newConditionalExpressionHolders;
+		foreach ($other->newConditionalExpressionHolders as $exprString => $holders) {
+			if (!array_key_exists($exprString, $conditionalExpressionHolders)) {
+				$conditionalExpressionHolders[$exprString] = $holders;
+			} else {
+				$conditionalExpressionHolders[$exprString] = array_merge($conditionalExpressionHolders[$exprString], $holders);
+			}
+		}
+		$result->newConditionalExpressionHolders = $conditionalExpressionHolders;
+
+		return $result->setRootExpr($rootExpr);
+	}
+
+	private function mergeRootExpr(?Expr $rootExprA, ?Expr $rootExprB): ?Expr
+	{
+		if ($rootExprA === $rootExprB) {
+			return $rootExprA;
+		}
+
+		if ($rootExprA === null || $rootExprB === null) {
+			return $rootExprA ?? $rootExprB;
+		}
+
+		return null;
+	}
+
+}

@@ -1,0 +1,81 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\FuncCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\Reflection\ParameterReflection;
+use PHPStan\Type\Accessory\AccessoryNonEmptyStringType;
+use PHPStan\Type\FunctionParameterOutTypeExtension;
+use PHPStan\Type\IntersectionType;
+use PHPStan\Type\NullType;
+use PHPStan\Type\StringType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use PHPStan\Type\UnionType;
+use function in_array;
+use function strtolower;
+use function substr;
+
+#[AutowiredService]
+final class OpenSslEncryptParameterOutTypeExtension implements FunctionParameterOutTypeExtension
+{
+
+	public function __construct(private OpenSslCipherMethodsProvider $cipherMethodsProvider)
+	{
+	}
+
+	public function isFunctionSupported(FunctionReflection $functionReflection, ParameterReflection $parameter): bool
+	{
+		return $functionReflection->getName() === 'openssl_encrypt' && $parameter->getName() === 'tag';
+	}
+
+	public function getParameterOutTypeFromFunctionCall(FunctionReflection $functionReflection, FuncCall $funcCall, ParameterReflection $parameter, Scope $scope): ?Type
+	{
+		$args = $funcCall->getArgs();
+		$cipherArg = $args[1] ?? null;
+
+		if ($cipherArg === null) {
+			return null;
+		}
+
+		$tagTypes = [];
+
+		foreach ($scope->getType($cipherArg->value)->getConstantStrings() as $cipherType) {
+			$cipher = strtolower($cipherType->getValue());
+			$mode = substr($cipher, -3);
+
+			if (!$this->cipherMethodsProvider->isSupportedCipherMethod($cipher)) {
+				$tagTypes[] = new NullType();
+				continue;
+			}
+
+			if (in_array($mode, ['gcm', 'ccm'], true)) {
+				$tagTypes[] = new IntersectionType([
+					new StringType(),
+					new AccessoryNonEmptyStringType(),
+				]);
+
+				continue;
+			}
+
+			$tagTypes[] = new NullType();
+		}
+
+		if ($tagTypes === []) {
+			return new UnionType([
+				new IntersectionType([
+					new StringType(),
+					new AccessoryNonEmptyStringType(),
+				]),
+				new NullType(),
+			]);
+		}
+
+		return TypeCombinator::union(...$tagTypes);
+	}
+
+}
