@@ -1,0 +1,33 @@
+<?php 
+
+namespace PHPStan\Rules\Constants;
+return;
+
+use PHPStan\DependencyInjection\ExtensionInterface;
+use PHPStan\Reflection\ClassConstantReflection;
+
+/**
+ * This is the extension interface to implement if you want to describe
+ * always-used class constant.
+ *
+ * To register it in the configuration file use the `phpstan.constants.alwaysUsedClassConstantsExtension` service tag:
+ *
+ * ```
+ * services:
+ * 	-
+ *		class: App\PHPStan\MyExtension
+ *		tags:
+ *			- phpstan.constants.alwaysUsedClassConstantsExtension
+ * ```
+ *
+ * Learn more: https://phpstan.org/developing-extensions/always-used-class-constants
+ *
+ * @api
+ */
+#[ExtensionInterface(tag: 'phpstan.constants.alwaysUsedClassConstantsExtension')]
+interface AlwaysUsedClassConstantsExtension
+{
+
+	public function isAlwaysUsed(ClassConstantReflection $constant): bool;
+
+}
