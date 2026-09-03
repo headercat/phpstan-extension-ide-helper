@@ -1,0 +1,42 @@
+<?php 
+
+namespace PHPStan\Node\Expr;
+return;
+
+use Override;
+use PhpParser\Node\Expr;
+use PHPStan\Node\VirtualNode;
+
+final class PossiblyImpureCallExpr extends Expr implements VirtualNode
+{
+
+	public function __construct(
+		public Expr $callExpr,
+		public Expr $impactedExpr,
+		private string $callDescription,
+	)
+	{
+		parent::__construct([]);
+	}
+
+	public function getCallDescription(): string
+	{
+		return $this->callDescription;
+	}
+
+	#[Override]
+	public function getType(): string
+	{
+		return 'PHPStan_Node_PossiblyImpureCallExpr';
+	}
+
+	/**
+	 * @return string[]
+	 */
+	#[Override]
+	public function getSubNodeNames(): array
+	{
+		return ['callExpr', 'impactedExpr'];
+	}
+
+}

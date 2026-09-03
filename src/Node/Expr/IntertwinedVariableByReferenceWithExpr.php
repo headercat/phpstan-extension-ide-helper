@@ -1,0 +1,50 @@
+<?php 
+
+namespace PHPStan\Node\Expr;
+return;
+
+use Override;
+use PhpParser\Node\Expr;
+use PHPStan\Node\VirtualNode;
+use PHPStan\Turbo\ReferencedByTurboExtension;
+
+#[ReferencedByTurboExtension(key: 'intertwinedVariableByReferenceWithExpr')]
+final class IntertwinedVariableByReferenceWithExpr extends Expr implements VirtualNode
+{
+
+	public function __construct(private string $variableName, public Expr $expr, private Expr $assignedExpr)
+	{
+		parent::__construct([]);
+	}
+
+	public function getVariableName(): string
+	{
+		return $this->variableName;
+	}
+
+	public function getExpr(): Expr
+	{
+		return $this->expr;
+	}
+
+	public function getAssignedExpr(): Expr
+	{
+		return $this->assignedExpr;
+	}
+
+	#[Override]
+	public function getType(): string
+	{
+		return 'PHPStan_Node_IntertwinedVariableByReferenceWithExpr';
+	}
+
+	/**
+	 * @return string[]
+	 */
+	#[Override]
+	public function getSubNodeNames(): array
+	{
+		return ['expr'];
+	}
+
+}

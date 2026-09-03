@@ -1,0 +1,62 @@
+<?php 
+
+namespace PHPStan\File;
+return;
+
+use Symfony\Component\Finder\Finder;
+use function array_filter;
+use function array_map;
+use function array_unique;
+use function array_values;
+use function file_exists;
+use function implode;
+use function is_file;
+use function sort;
+
+final class FileFinder
+{
+
+	/**
+	 * @param string[] $fileExtensions
+	 */
+	public function __construct(
+		private FileExcluder $fileExcluder,
+		private FileHelper $fileHelper,
+		private array $fileExtensions,
+	)
+	{
+	}
+
+	/**
+	 * @param string[] $paths
+	 */
+	public function findFiles(array $paths): FileFinderResult
+	{
+		$onlyFiles = true;
+		$files = [];
+		foreach ($paths as $path) {
+			if (is_file($path)) {
+				$files[] = $path;
+			} elseif (!file_exists($path)) {
+				throw new PathNotFoundException($path);
+			} else {
+				$finder = new Finder();
+				$finder->followLinks();
+				foreach ($finder->files()->name('*.{' . implode(',', $this->fileExtensions) . '}')->in($path) as $fileInfo) {
+					$files[] = $fileInfo->getPathname();
+					$onlyFiles = false;
+				}
+			}
+		}
+
+		$files = array_filter($files, fn (string $file): bool => !$this->fileExcluder->isExcludedFromAnalysing($file));
+
+		sort($files);
+
+		return new FileFinderResult(
+			array_values(array_unique(array_map(fn (string $file): string => $this->fileHelper->normalizePath($file), $files))),
+			$onlyFiles,
+		);
+	}
+
+}
