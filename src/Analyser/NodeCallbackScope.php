@@ -1,0 +1,309 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PhpParser\Node\Expr;
+use PHPStan\Node\Expr\TypeExpr;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Reflection\ParameterReflection;
+use PHPStan\Type\Type;
+use WeakReference;
+use function array_pop;
+use function count;
+use function spl_object_id;
+
+final class NodeCallbackScope extends MutatingScope
+{
+
+	/** @var Expr[] */
+	private array $truthyValueExprs = [];
+
+	/** @var Expr[] */
+	private array $falseyValueExprs = [];
+
+	private ?MutatingScope $walkScope = null;
+
+	/** @var WeakReference<MutatingScope>|null */
+	private ?WeakReference $seededWalkScope = null;
+
+	public function toNodeCallbackScope(): self
+	{
+		return $this;
+	}
+
+	/**
+	 * Called by MutatingScope::toNodeCallbackScope() with the scope this one was
+	 * created from: same state, so it can answer toWalkScope() directly -
+	 * keeping its resolvedTypes memo and the identity with stored results'
+	 * beforeScope that askScopeVariableStateMatches() short-circuits on.
+	 * Weakly referenced: the origin caches this scope in its $nodeCallbackScope, a
+	 * strong back-reference would cycle and never free with GC disabled.
+	 */
+	public function seedWalkScope(MutatingScope $scope): void
+	{
+		$this->seededWalkScope = WeakReference::create($scope);
+	}
+
+	public function toWalkScope(): MutatingScope
+	{
+		if ($this->walkScope !== null) {
+			return $this->walkScope;
+		}
+
+		if ($this->seededWalkScope !== null) {
+			$seeded = $this->seededWalkScope->get();
+			if ($seeded !== null) {
+				return $seeded;
+			}
+		}
+
+		return $this->walkScope = $this->scopeFactory->toWalkScopeFactory()->create(
+			$this->context,
+			$this->isDeclareStrictTypes(),
+			$this->getFunction(),
+			$this->getNamespace(),
+			$this->expressionTypes,
+			$this->nativeExpressionTypes,
+			$this->conditionalExpressions,
+			$this->inClosureBindScopeClasses,
+			$this->getAnonymousFunctionReflection(),
+			$this->isInFirstLevelStatement(),
+			$this->currentlyAssignedExpressions,
+			$this->currentlyAllowedUndefinedExpressions,
+			$this->inFunctionCallsStack,
+			$this->afterExtractCall,
+			$this->getParentScope(),
+			$this->nativeTypesPromoted,
+			$this->templateArgumentFrame,
+			$this->templateArgumentConstraints,
+		);
+	}
+
+	/**
+	 * Asked types memoized by node identity. Rules and collectors re-ask the
+	 * same nodes across a callback batch (this scope is shared by every
+	 * callback fired at the emission point), and the walk scope's own
+	 * resolvedTypes memo answered those in O(1) before this class existed -
+	 * without this, every repeat pays the stored-result guard again. The
+	 * entry keeps the node itself: a synthetic node a rule dropped can hand
+	 * its object id to the next synthetic, and the identity check rejects
+	 * such stale hits.
+	 *
+	 * @var array<int, array{Expr, Type}>
+	 */
+	private array $askedTypes = [];
+
+	/** @var array<int, array{Expr, Type}> */
+	private array $askedNativeTypes = [];
+
+	/** @api */
+	public function getType(Expr $node): Type
+	{
+		if ($node instanceof TypeExpr) {
+			// scope-independent by construction
+			return $node->getExprType();
+		}
+
+		$nodeId = spl_object_id($node);
+		if (isset($this->askedTypes[$nodeId]) && $this->askedTypes[$nodeId][0] === $node) {
+			return $this->askedTypes[$nodeId][1];
+		}
+
+		$type = $this->doGetType($node);
+		$this->askedTypes[$nodeId] = [$node, $type];
+
+		return $type;
+	}
+
+	private function doGetType(Expr $node): Type
+	{
+		if (
+			!$this->nativeTypesPromoted
+			&& count($this->truthyValueExprs) === 0
+			&& count($this->falseyValueExprs) === 0
+		) {
+			$storedResult = $this->findSettledStoredResult($node);
+			if ($storedResult !== null) {
+				return $this->getStoredResultTypeOnThisScope($storedResult, $node, false);
+			}
+
+			// post-order emission means every real subnode is already stored -
+			// an unstored ask is a synthetic node or a node ahead of the walk,
+			// answered on demand through the MutatingScope path
+			return $this->toWalkScope()->getType($node);
+		}
+
+		$storedResult = $this->findSettledStoredResult($node);
+		if ($storedResult !== null) {
+			$scope = $this->preprocessScope($storedResult->getBeforeScope());
+			return $scope->getType($node);
+		}
+
+		// the filters/promotion already narrowed this scope's own tables
+		return $this->toWalkScope()->getType($node);
+	}
+
+	/**
+	 * Consumes a stored result guarded by this scope's position instead of
+	 * reading the naked walk-position type: a callback may have derived this
+	 * scope (e.g. assignExpression() pinning a call-site literal onto a
+	 * parameter) and the walk-position memo predates that. On a state match
+	 * the result's own read is the answer; a counterfactual ask re-prices on
+	 * the MutatingScope, mirroring resolveTypeOfNewWorldHandlerNode().
+	 */
+	private function getStoredResultTypeOnThisScope(ExpressionResult $result, Expr $node, bool $useNativeTypes): Type
+	{
+		$scope = $this->toWalkScope();
+		if ($result->canResolveOwnType() && $result->askScopeVariableStateMatches($scope, $useNativeTypes, true)) {
+			return $useNativeTypes ? $result->getNativeType() : $result->getType();
+		}
+
+		return $useNativeTypes ? $scope->getNativeType($node) : $scope->getType($node);
+	}
+
+	public function getScopeType(Expr $expr): Type
+	{
+		return $this->toWalkScope()->getType($expr);
+	}
+
+	public function getScopeNativeType(Expr $expr): Type
+	{
+		return $this->toWalkScope()->getNativeType($expr);
+	}
+
+	/** @api */
+	public function getNativeType(Expr $expr): Type
+	{
+		if ($expr instanceof TypeExpr) {
+			// See getType() - same reasoning
+			return $expr->getExprType();
+		}
+
+		$nodeId = spl_object_id($expr);
+		if (isset($this->askedNativeTypes[$nodeId]) && $this->askedNativeTypes[$nodeId][0] === $expr) {
+			return $this->askedNativeTypes[$nodeId][1];
+		}
+
+		$type = $this->doGetNativeType($expr);
+		$this->askedNativeTypes[$nodeId] = [$expr, $type];
+
+		return $type;
+	}
+
+	private function doGetNativeType(Expr $expr): Type
+	{
+		if (
+			!$this->nativeTypesPromoted
+			&& count($this->truthyValueExprs) === 0
+			&& count($this->falseyValueExprs) === 0
+		) {
+			$storedResult = $this->findSettledStoredResult($expr);
+			if ($storedResult !== null) {
+				return $this->getStoredResultTypeOnThisScope($storedResult, $expr, true);
+			}
+
+			return $this->toWalkScope()->getNativeType($expr);
+		}
+
+		$storedResult = $this->findSettledStoredResult($expr);
+		if ($storedResult !== null) {
+			$scope = $this->preprocessScope($storedResult->getBeforeScope());
+			return $scope->getNativeType($expr);
+		}
+
+		return $this->toWalkScope()->getNativeType($expr);
+	}
+
+	public function getKeepVoidType(Expr $node): Type
+	{
+		$storedResult = $this->findSettledStoredResult($node);
+		if ($storedResult !== null) {
+			$scope = $this->preprocessScope($storedResult->getBeforeScope());
+
+			return $scope->getKeepVoidType($node);
+		}
+
+		return $this->toWalkScope()->getKeepVoidType($node);
+	}
+
+	public function filterByTruthyValue(Expr $expr): self
+	{
+		/** @var self $scope */
+		$scope = parent::filterByTruthyValue($expr);
+		$scope->truthyValueExprs = $this->truthyValueExprs;
+		$scope->falseyValueExprs = $this->falseyValueExprs;
+		$scope->truthyValueExprs[] = $expr;
+
+		return $scope;
+	}
+
+	public function filterByFalseyValue(Expr $expr): self
+	{
+		/** @var self $scope */
+		$scope = parent::filterByFalseyValue($expr);
+		$scope->truthyValueExprs = $this->truthyValueExprs;
+		$scope->falseyValueExprs = $this->falseyValueExprs;
+		$scope->falseyValueExprs[] = $expr;
+
+		return $scope;
+	}
+
+	private function preprocessScope(MutatingScope $scope): Scope
+	{
+		// a nested walk a rule started from its NodeCallbackScope may have
+		// anchored results to callback scopes - re-entering this class's ask
+		// paths from here would derive scopes without end
+		$scope = $scope->toWalkScope();
+		if ($this->nativeTypesPromoted) {
+			$scope = $scope->doNotTreatPhpDocTypesAsCertain();
+		}
+
+		foreach ($this->truthyValueExprs as $expr) {
+			$scope = $scope->filterByTruthyValue($expr);
+		}
+		foreach ($this->falseyValueExprs as $expr) {
+			$scope = $scope->filterByFalseyValue($expr);
+		}
+
+		return $scope;
+	}
+
+	/**
+	 * @param MethodReflection|FunctionReflection|null $reflection
+	 */
+	public function pushInFunctionCall($reflection, ?ParameterReflection $parameter, bool $rememberTypes): self
+	{
+		/** @var self $scope */
+		$scope = parent::pushInFunctionCall($reflection, $parameter, $rememberTypes);
+		$scope->truthyValueExprs = $this->truthyValueExprs;
+		$scope->falseyValueExprs = $this->falseyValueExprs;
+
+		return $scope;
+	}
+
+	public function popInFunctionCall(): self
+	{
+		$stack = $this->inFunctionCallsStack;
+		array_pop($stack);
+
+		/** @var self $scope */
+		$scope = parent::popInFunctionCall();
+		$scope->truthyValueExprs = $this->truthyValueExprs;
+		$scope->falseyValueExprs = $this->falseyValueExprs;
+
+		return $scope;
+	}
+
+	public function getParentScope(): ?MutatingScope
+	{
+		$parent = parent::getParentScope();
+		if ($parent === null) {
+			return null;
+		}
+
+		return $parent->toNodeCallbackScope();
+	}
+
+}
