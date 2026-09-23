@@ -1,0 +1,75 @@
+<?php 
+
+namespace PHPStan\Analyser\StmtHandler;
+return;
+
+use PhpParser\Node\Scalar\Int_;
+use PhpParser\Node\Stmt;
+use PhpParser\Node\Stmt\Declare_;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\InternalStatementResult;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\StatementContext;
+use PHPStan\Analyser\StmtHandler;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+
+/**
+ * @implements StmtHandler<Declare_>
+ */
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/DeclareHandler.cpp')]
+final class DeclareHandler implements StmtHandler
+{
+
+	public function supports(Stmt $stmt): bool
+	{
+		return $stmt instanceof Declare_;
+	}
+
+	public function processStmt(
+		NodeScopeResolver $nodeScopeResolver,
+		Stmt $stmt,
+		MutatingScope $scope,
+		ExpressionResultStorage $storage,
+		callable $nodeCallback,
+		StatementContext $context,
+	): InternalStatementResult
+	{
+		$hasYield = false;
+		$throwPoints = [];
+		$impurePoints = [];
+		$alwaysTerminating = false;
+		$exitPoints = [];
+		foreach ($stmt->declares as $declare) {
+			$nodeScopeResolver->callNodeCallback($nodeCallback, $declare, $scope, $storage);
+			// the value is a constant scalar - process it so its result is stored
+			// before the callback fires on it, like every other expression node
+			$nodeScopeResolver->processExprNode($stmt, $declare->value, $scope, $storage, $nodeCallback, ExpressionContext::createDeep($context->shouldResolveTemplateArguments()));
+			if (
+				$declare->key->name !== 'strict_types'
+				|| !($declare->value instanceof Int_)
+				|| $declare->value->value !== 1
+			) {
+				continue;
+			}
+
+			$scope = $scope->enterDeclareStrictTypes();
+		}
+
+		if ($stmt->stmts !== null) {
+			$result = $nodeScopeResolver->processStmtNodesInternal($stmt, $stmt->stmts, $scope, $storage, $nodeCallback, $context);
+			$scope = $result->getScope();
+			$hasYield = $result->hasYield();
+			$throwPoints = $result->getThrowPoints();
+			$impurePoints = $result->getImpurePoints();
+			$alwaysTerminating = $result->isAlwaysTerminating();
+			$exitPoints = $result->getExitPoints();
+		}
+
+		return new InternalStatementResult($scope, hasYield: $hasYield, isAlwaysTerminating: $alwaysTerminating, exitPoints: $exitPoints, throwPoints: $throwPoints, impurePoints: $impurePoints);
+	}
+
+}

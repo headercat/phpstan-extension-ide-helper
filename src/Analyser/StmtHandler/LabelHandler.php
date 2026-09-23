@@ -1,0 +1,42 @@
+<?php 
+
+namespace PHPStan\Analyser\StmtHandler;
+return;
+
+use PhpParser\Node\Stmt;
+use PhpParser\Node\Stmt\Label;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\InternalStatementResult;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\StatementContext;
+use PHPStan\Analyser\StmtHandler;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+
+/**
+ * @implements StmtHandler<Label>
+ */
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/LabelHandler.cpp')]
+final class LabelHandler implements StmtHandler
+{
+
+	public function supports(Stmt $stmt): bool
+	{
+		return $stmt instanceof Label;
+	}
+
+	public function processStmt(
+		NodeScopeResolver $nodeScopeResolver,
+		Stmt $stmt,
+		MutatingScope $scope,
+		ExpressionResultStorage $storage,
+		callable $nodeCallback,
+		StatementContext $context,
+	): InternalStatementResult
+	{
+		return new InternalStatementResult($scope, hasYield: false, isAlwaysTerminating: false, exitPoints: [], throwPoints: [], impurePoints: []);
+	}
+
+}

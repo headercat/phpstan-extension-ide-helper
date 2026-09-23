@@ -1,0 +1,41 @@
+<?php 
+
+namespace PHPStan\Rules\RuleErrors;
+return;
+
+use PHPStan\Rules\FileDependenciesRuleError;
+use PHPStan\Rules\RuleError;
+use PHPStan\Rules\TipRuleError;
+
+/**
+ * @internal Use PHPStan\Rules\RuleErrorBuilder instead.
+ */
+final class RuleError265 implements RuleError, TipRuleError, FileDependenciesRuleError
+{
+
+	public string $message;
+
+	public string $tip;
+
+	/** @var list<string> */
+	public array $fileDependencies;
+
+	public function getMessage(): string
+	{
+		return $this->message;
+	}
+
+	public function getTip(): string
+	{
+		return $this->tip;
+	}
+
+	/**
+	 * @return list<string>
+	 */
+	public function getFileDependencies(): array
+	{
+		return $this->fileDependencies;
+	}
+
+}

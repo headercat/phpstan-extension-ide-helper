@@ -1,0 +1,50 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PHPStan\Turbo\ShadowedByTurboExtension;
+
+/**
+ * The state NodeScopeResolver threads from one statement of a statement list
+ * to the next. A snapshot (clone) taken before a statement is everything the
+ * walk needs to continue from that statement again.
+ */
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/StatementListWalkState.cpp')]
+final class StatementListWalkState
+{
+
+	/** @var array<int, VariableFlow|null> */
+	public array $variableFlows = [];
+
+	public bool $alreadyTerminated = false;
+
+	public bool $hasYield = false;
+
+	/** @var InternalStatementExitPoint[] */
+	public array $exitPoints = [];
+
+	/** @var InternalThrowPoint[] */
+	public array $throwPoints = [];
+
+	/** @var ImpurePoint[] */
+	public array $impurePoints = [];
+
+	public function __construct(public MutatingScope $scope)
+	{
+	}
+
+	public function toResult(): InternalStatementResult
+	{
+		return new InternalStatementResult(
+			$this->scope,
+			$this->hasYield,
+			$this->alreadyTerminated,
+			$this->exitPoints,
+			$this->throwPoints,
+			$this->impurePoints,
+			variableFlow: VariableFlow::sequence(...$this->variableFlows),
+		);
+	}
+
+}
