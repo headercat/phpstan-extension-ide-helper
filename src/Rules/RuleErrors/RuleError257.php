@@ -1,0 +1,33 @@
+<?php 
+
+namespace PHPStan\Rules\RuleErrors;
+return;
+
+use PHPStan\Rules\FileDependenciesRuleError;
+use PHPStan\Rules\RuleError;
+
+/**
+ * @internal Use PHPStan\Rules\RuleErrorBuilder instead.
+ */
+final class RuleError257 implements RuleError, FileDependenciesRuleError
+{
+
+	public string $message;
+
+	/** @var list<string> */
+	public array $fileDependencies;
+
+	public function getMessage(): string
+	{
+		return $this->message;
+	}
+
+	/**
+	 * @return list<string>
+	 */
+	public function getFileDependencies(): array
+	{
+		return $this->fileDependencies;
+	}
+
+}

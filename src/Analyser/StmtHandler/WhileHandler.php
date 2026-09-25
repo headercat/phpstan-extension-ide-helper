@@ -1,0 +1,243 @@
+<?php 
+
+namespace PHPStan\Analyser\StmtHandler;
+return;
+
+use PhpParser\Node\Stmt;
+use PhpParser\Node\Stmt\Break_;
+use PhpParser\Node\Stmt\While_;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\InternalStatementResult;
+use PHPStan\Analyser\LoopWrittenVariableNames;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\NoopNodeCallback;
+use PHPStan\Analyser\RecordingNodeCallback;
+use PHPStan\Analyser\StatementContext;
+use PHPStan\Analyser\StmtHandler;
+use PHPStan\Analyser\TypeSpecifierContext;
+use PHPStan\Analyser\VariableFlow;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Node\BreaklessWhileLoopNode;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use function array_merge;
+use function count;
+
+/**
+ * @implements StmtHandler<While_>
+ */
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/WhileHandler.cpp')]
+final class WhileHandler implements StmtHandler
+{
+
+	public function __construct(
+		#[AutowiredParameter]
+		private bool $polluteScopeWithLoopInitialAssignments,
+		#[AutowiredParameter]
+		private bool $treatPhpDocTypesAsCertain,
+	)
+	{
+	}
+
+	public function supports(Stmt $stmt): bool
+	{
+		return $stmt instanceof While_;
+	}
+
+	public function processStmt(
+		NodeScopeResolver $nodeScopeResolver,
+		Stmt $stmt,
+		MutatingScope $scope,
+		ExpressionResultStorage $storage,
+		callable $nodeCallback,
+		StatementContext $context,
+	): InternalStatementResult
+	{
+		$originalStorage = $storage;
+		$storage = $originalStorage->duplicate();
+		// pass-local storages are pushed for the duration of each pass so
+		// in-pass asks (applySpecifiedTypes pricing, branch-scope derivation)
+		// read the pass's own results instead of re-pricing on demand
+		$scope->pushExpressionResultStorage($storage);
+		try {
+			$condResult = $nodeScopeResolver->processExprNode($stmt, $stmt->cond, $scope, $storage, new NoopNodeCallback(), ExpressionContext::createDeep(resolveTemplateArguments: false));
+			$beforeCondBooleanType = ($this->treatPhpDocTypesAsCertain ? $condResult->getType() : $condResult->getNativeType())->toBoolean();
+			$condScope = $condResult->getFalseyScope();
+			if (!$context->isTopLevel() && $beforeCondBooleanType->isFalse()->yes()) {
+				if (!$this->polluteScopeWithLoopInitialAssignments) {
+					$scope = $condScope->mergeWith($scope);
+				}
+
+				return new InternalStatementResult(
+					$scope,
+					hasYield: $condResult->hasYield(),
+					isAlwaysTerminating: false,
+					exitPoints: [],
+					throwPoints: $condResult->getThrowPoints(),
+					impurePoints: $condResult->getImpurePoints(),
+					variableFlow: $condResult->getVariableFlow(),
+				);
+			}
+			$bodyScope = $condResult->getTruthyScope();
+		} finally {
+			$scope->popExpressionResultStorage();
+		}
+
+		$replayCondRecording = null;
+		$replayBodyRecording = null;
+		$replayCondResult = null;
+		$replayPassStorage = null;
+		$replayPassResult = null;
+		$prevEntryScope = null;
+		if ($context->isTopLevel()) {
+			$count = 0;
+			$bodyIsReplayable = $nodeScopeResolver->isReplayableConvergenceBody($stmt, $stmt->stmts);
+			do {
+				$prevScope = $bodyScope;
+				$bodyScope = $bodyScope->mergeWith($scope);
+				if ($prevEntryScope !== null && $bodyScope->equals($prevEntryScope)) {
+					// walking is deterministic in the entry scope - an unchanged entry
+					// reproduces the previous pass's exit, so the verification walk is skipped
+					$bodyScope = $prevScope;
+					break;
+				}
+				$prevEntryScope = $bodyScope;
+				$storage = $originalStorage->duplicate();
+				$condRecording = $bodyIsReplayable ? new RecordingNodeCallback() : new NoopNodeCallback();
+				$bodyRecording = $bodyIsReplayable ? new RecordingNodeCallback() : new NoopNodeCallback();
+				$scope->pushExpressionResultStorage($storage);
+				try {
+					$passCondResult = $nodeScopeResolver->processExprNode($stmt, $stmt->cond, $bodyScope, $storage, $condRecording, ExpressionContext::createDeep(resolveTemplateArguments: false));
+					$bodyScope = $passCondResult->getTruthyScope();
+					$bodyScopeResult = $nodeScopeResolver->processStmtNodesInternal($stmt, $stmt->stmts, $bodyScope, $storage, $bodyRecording, $context->enterDeep()->withoutTemplateArgumentResolution())->filterOutLoopExitPoints();
+					$backEdgeScope = $bodyScopeResult->getLoopBackEdgeScope();
+				} finally {
+					$scope->popExpressionResultStorage();
+				}
+				if ($backEdgeScope === null) {
+					$bodyScope = $prevScope;
+					break;
+				}
+				$bodyScope = $backEdgeScope;
+				// the candidate to replace the final walk when this pass's
+				// entry turns out to be the fixpoint
+				if ($condRecording instanceof RecordingNodeCallback) {
+					$replayCondRecording = $condRecording;
+					$replayBodyRecording = $bodyRecording;
+					$replayPassStorage = $storage;
+					$replayPassResult = $bodyScopeResult;
+					$replayCondResult = $passCondResult;
+				}
+				if ($bodyScope->equals($prevScope)) {
+					break;
+				}
+
+				if ($count >= NodeScopeResolver::GENERALIZE_AFTER_ITERATION) {
+					$bodyScope = $prevScope->generalizeWith(
+						$bodyScope,
+						LoopWrittenVariableNames::collect($stmt, VariableFlow::sequence($passCondResult->getVariableFlow(), $bodyScopeResult->getVariableFlow())),
+					);
+				}
+				$count++;
+			} while ($count < NodeScopeResolver::LOOP_SCOPE_ITERATIONS);
+		}
+
+		$bodyScope = $bodyScope->mergeWith($scope);
+		$bodyScopeMaybeRan = $bodyScope;
+		$storage = $originalStorage;
+		if (
+			$replayCondRecording !== null && $replayBodyRecording !== null
+			&& $replayPassStorage !== null && $replayPassResult !== null
+			&& $replayCondResult !== null
+			&& $bodyScope->equals($prevEntryScope)
+		) {
+			// the final walk would repeat the recorded fixpoint pass exactly
+			// (same entry scope, deterministic walk) - adopt the pass's results
+			// and replay its emissions through the real callback instead
+			$originalStorage->mergeResults($replayPassStorage);
+			$nodeScopeResolver->replayRecording($replayCondRecording, $nodeCallback, $originalStorage, $scope);
+			// the While_ callback is deferred from processStmtNode(): it fires
+			// after the condition's result is available, with the entry scope
+			$nodeScopeResolver->callNodeCallback($nodeCallback, $stmt, $scope, $storage);
+			$nodeScopeResolver->replayRecording($replayBodyRecording, $nodeCallback, $originalStorage, $scope);
+			$bodyCondResult = $replayCondResult;
+			$finalScopeResult = $replayPassResult;
+		} else {
+			$bodyCondResult = $nodeScopeResolver->processExprNode($stmt, $stmt->cond, $bodyScope, $storage, $nodeCallback, ExpressionContext::createDeep($context->shouldResolveTemplateArguments()));
+			// the While_ callback is deferred from processStmtNode(): it fires after
+			// the condition's real walk stored its result, with the entry scope
+			$nodeScopeResolver->callNodeCallback($nodeCallback, $stmt, $scope, $storage);
+			$bodyScope = $bodyCondResult->getTruthyScope();
+			$finalScopeResult = $nodeScopeResolver->processStmtNodesInternal($stmt, $stmt->stmts, $bodyScope, $storage, $nodeCallback, $context)->filterOutLoopExitPoints();
+		}
+		$backEdgeScope = $finalScopeResult->getLoopBackEdgeScope();
+		$backEdgeDead = $backEdgeScope === null;
+		$finalScope = $backEdgeScope ?? $finalScopeResult->getScope();
+		// the loop condition narrows the post-loop scope to its falsey branch;
+		// $finalScope (after the body ran) is a different scope than the condition's
+		// own, so reprocess the condition there rather than re-running its result.
+		// The duplicate lets subresults whose state did not change in the body
+		// answer from the final pass instead of being re-priced.
+		$finalScope = $finalScope->applySpecifiedTypes($nodeScopeResolver->processExprOnDemand($stmt->cond, $finalScope, $storage->duplicate())->getSpecifiedTypesForScope($finalScope, TypeSpecifierContext::createFalsey()));
+
+		$alwaysIterates = false;
+		$neverIterates = false;
+		if ($context->isTopLevel()) {
+			$condBooleanType = ($this->treatPhpDocTypesAsCertain ? $bodyCondResult->getType() : $bodyCondResult->getNativeType())->toBoolean();
+			$alwaysIterates = $condBooleanType->isTrue()->yes();
+			$neverIterates = $condBooleanType->isFalse()->yes();
+		}
+		$breakExitPoints = $finalScopeResult->getExitPointsByType(Break_::class);
+		if (count($breakExitPoints) > 0) {
+			$breakScope = $alwaysIterates || $backEdgeDead ? null : $finalScope;
+			foreach ($breakExitPoints as $breakExitPoint) {
+				$breakScope = $breakScope === null ? $breakExitPoint->getScope() : $breakScope->mergeWith($breakExitPoint->getScope());
+			}
+			$finalScope = $breakScope;
+		}
+
+		$isIterableAtLeastOnce = $beforeCondBooleanType->isTrue()->yes();
+		$nodeScopeResolver->callNodeCallback($nodeCallback, new BreaklessWhileLoopNode($stmt, $finalScopeResult->toPublic()->getExitPoints(), $finalScopeResult->hasYield()), $bodyScopeMaybeRan, $storage);
+
+		if ($alwaysIterates) {
+			$isAlwaysTerminating = count($finalScopeResult->getExitPointsByType(Break_::class)) === 0;
+		} elseif ($isIterableAtLeastOnce) {
+			$isAlwaysTerminating = $finalScopeResult->isAlwaysTerminating();
+		} else {
+			$isAlwaysTerminating = false;
+		}
+		if ($backEdgeDead && count($breakExitPoints) === 0) {
+			$finalScope = null;
+		}
+		if (!$isIterableAtLeastOnce) {
+			if (!$this->polluteScopeWithLoopInitialAssignments) {
+				$condScope = $condScope->mergeWith($scope);
+			}
+			$finalScope = $finalScope === null ? $condScope : $finalScope->mergeWith($condScope);
+		}
+		$finalScope ??= $finalScopeResult->getScope();
+
+		$throwPoints = $condResult->getThrowPoints();
+		$impurePoints = $condResult->getImpurePoints();
+		if (!$neverIterates) {
+			$throwPoints = array_merge($throwPoints, $finalScopeResult->getThrowPoints());
+			$impurePoints = array_merge($impurePoints, $finalScopeResult->getImpurePoints());
+		}
+
+		return new InternalStatementResult(
+			$finalScope,
+			hasYield: $finalScopeResult->hasYield() || $condResult->hasYield(),
+			isAlwaysTerminating: $isAlwaysTerminating,
+			exitPoints: $finalScopeResult->getExitPointsForOuterLoop(),
+			throwPoints: $throwPoints,
+			impurePoints: $impurePoints,
+			// the body may run or not whatever the condition says: a write in
+			// it does not make an earlier write dead, and a usage in it counts
+			variableFlow: VariableFlow::loop($bodyCondResult->getVariableFlow(), $finalScopeResult->getVariableFlow(), null, false, true),
+		);
+	}
+
+}

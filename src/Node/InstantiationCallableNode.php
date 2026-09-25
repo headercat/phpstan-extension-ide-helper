@@ -1,0 +1,55 @@
+<?php 
+
+namespace PHPStan\Node;
+return;
+
+use Override;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Name;
+use PHPStan\Node\Printer\ExprPrinter;
+use PHPStan\Turbo\ReferencedByTurboExtension;
+
+/**
+ * @api
+ */
+#[ReferencedByTurboExtension(key: 'instantiationCallableNode')]
+final class InstantiationCallableNode extends Expr implements VirtualNode
+{
+
+	public function __construct(private Name|Expr $class, private Expr\New_ $originalNode)
+	{
+		// the original's printed expression key must not become this node's
+		$attributes = $this->originalNode->getAttributes();
+		unset($attributes[ExprPrinter::ATTRIBUTE_CACHE_KEY]);
+		parent::__construct($attributes);
+	}
+
+	/**
+	 * @return Expr|Name
+	 */
+	public function getClass()
+	{
+		return $this->class;
+	}
+
+	public function getOriginalNode(): Expr\New_
+	{
+		return $this->originalNode;
+	}
+
+	#[Override]
+	public function getType(): string
+	{
+		return 'PHPStan_Node_InstantiationCallableNode';
+	}
+
+	/**
+	 * @return string[]
+	 */
+	#[Override]
+	public function getSubNodeNames(): array
+	{
+		return [];
+	}
+
+}
