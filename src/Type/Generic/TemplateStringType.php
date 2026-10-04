@@ -1,0 +1,41 @@
+<?php 
+
+namespace PHPStan\Type\Generic;
+return;
+
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\StringType;
+use PHPStan\Type\Traits\UndecidedComparisonCompoundTypeTrait;
+use PHPStan\Type\Type;
+
+/** @api */
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/TemplateStringType.cpp')]
+final class TemplateStringType extends StringType implements TemplateType
+{
+
+	/** @use TemplateTypeTrait<StringType> */
+	use TemplateTypeTrait;
+	use UndecidedComparisonCompoundTypeTrait;
+
+	/**
+	 * @param non-empty-string $name
+	 */
+	public function __construct(
+		TemplateTypeScope $scope,
+		TemplateTypeStrategy $templateTypeStrategy,
+		TemplateTypeVariance $templateTypeVariance,
+		string $name,
+		StringType $bound,
+		?Type $default,
+	)
+	{
+		parent::__construct();
+		$this->scope = $scope;
+		$this->strategy = $templateTypeStrategy;
+		$this->variance = $templateTypeVariance;
+		$this->name = $name;
+		$this->bound = $bound;
+		$this->default = $default;
+	}
+
+}

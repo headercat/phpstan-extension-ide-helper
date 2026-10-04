@@ -1,0 +1,42 @@
+<?php 
+
+namespace PHPStan\Rules\Arrays;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+
+/**
+ * @implements Rule<Node\Stmt\Foreach_>
+ */
+#[RegisteredRule(level: 4)]
+final class DeadForeachRule implements Rule
+{
+
+	public function getNodeType(): string
+	{
+		return Node\Stmt\Foreach_::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		$iterableType = $scope->getType($node->expr);
+		if ($iterableType->isIterable()->no()) {
+			return [];
+		}
+
+		if (!$iterableType->isIterableAtLeastOnce()->no()) {
+			return [];
+		}
+
+		return [
+			RuleErrorBuilder::message('Empty array passed to foreach.')
+				->identifier('foreach.emptyArray')
+				->build(),
+		];
+	}
+
+}
