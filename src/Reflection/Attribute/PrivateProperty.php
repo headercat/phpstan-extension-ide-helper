@@ -1,0 +1,22 @@
+<?php 
+
+namespace PHPStan\Reflection\Attribute;
+return;
+
+use Attribute;
+use PHPStan\Turbo\ReferencedByTurboExtension;
+
+/**
+ * Marks a property the phar build made public that is private in the
+ * source. The build inlines single-return getters at their call sites
+ * (compiler's PrepareCommand), so the properties those getters read have to
+ * be readable from the callers; for PHPStan's own reflection the property
+ * stays private (PhpClassReflectionExtension), so code analysed against
+ * the phar cannot access it.
+ */
+#[Attribute(flags: Attribute::TARGET_PROPERTY | Attribute::TARGET_PARAMETER)]
+#[ReferencedByTurboExtension(key: 'privatePropertyAttribute')]
+final class PrivateProperty
+{
+
+}

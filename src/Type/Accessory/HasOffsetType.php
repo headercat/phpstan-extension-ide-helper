@@ -1,0 +1,484 @@
+<?php 
+
+namespace PHPStan\Type\Accessory;
+return;
+
+use ArrayAccess;
+use PHPStan\Php\PhpVersion;
+use PHPStan\PhpDocParser\Ast\Type\IdentifierTypeNode;
+use PHPStan\PhpDocParser\Ast\Type\TypeNode;
+use PHPStan\TrinaryLogic;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\AcceptsResult;
+use PHPStan\Type\ArrayType;
+use PHPStan\Type\BooleanType;
+use PHPStan\Type\CompoundType;
+use PHPStan\Type\Constant\ConstantIntegerType;
+use PHPStan\Type\Constant\ConstantStringType;
+use PHPStan\Type\Enum\EnumCaseObjectType;
+use PHPStan\Type\ErrorType;
+use PHPStan\Type\InstanceofDeprecated;
+use PHPStan\Type\IntegerRangeType;
+use PHPStan\Type\IntersectionType;
+use PHPStan\Type\IsSuperTypeOfResult;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\ObjectWithoutClassType;
+use PHPStan\Type\Traits\MaybeArrayTypeTrait;
+use PHPStan\Type\Traits\MaybeCallableTypeTrait;
+use PHPStan\Type\Traits\MaybeIterableTypeTrait;
+use PHPStan\Type\Traits\MaybeObjectTypeTrait;
+use PHPStan\Type\Traits\MaybeStringTypeTrait;
+use PHPStan\Type\Traits\NonGeneralizableTypeTrait;
+use PHPStan\Type\Traits\NonGenericTypeTrait;
+use PHPStan\Type\Traits\NonRemoveableTypeTrait;
+use PHPStan\Type\Traits\TruthyBooleanTypeTrait;
+use PHPStan\Type\Traits\UndecidedComparisonCompoundTypeTrait;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use PHPStan\Type\UnionType;
+use PHPStan\Type\VerbosityLevel;
+use function sprintf;
+use function strtolower;
+use function strtoupper;
+use const CASE_LOWER;
+use const CASE_UPPER;
+
+#[InstanceofDeprecated(insteadUse: 'Type::hasOffsetValueType()')]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/HasOffsetType.cpp')]
+class HasOffsetType implements CompoundType, AccessoryType
+{
+
+	use MaybeArrayTypeTrait;
+	use MaybeCallableTypeTrait;
+	use MaybeIterableTypeTrait;
+	use MaybeObjectTypeTrait;
+	use MaybeStringTypeTrait;
+	use TruthyBooleanTypeTrait;
+	use NonGenericTypeTrait;
+	use UndecidedComparisonCompoundTypeTrait;
+	use NonRemoveableTypeTrait;
+	use NonGeneralizableTypeTrait;
+
+	/**
+	 * @api
+	 */
+	public function __construct(private ConstantStringType|ConstantIntegerType $offsetType)
+	{
+	}
+
+	public function getOffsetType(): ConstantStringType|ConstantIntegerType
+	{
+		return $this->offsetType;
+	}
+
+	public function getReferencedClasses(): array
+	{
+		return [];
+	}
+
+	public function getObjectClassNames(): array
+	{
+		return [];
+	}
+
+	public function getObjectClassReflections(): array
+	{
+		return [];
+	}
+
+	public function accepts(Type $type, bool $strictTypes): AcceptsResult
+	{
+		if ($type instanceof CompoundType) {
+			return $type->isAcceptedBy($this, $strictTypes);
+		}
+
+		return new AcceptsResult($type->isOffsetAccessible()->and($type->hasOffsetValueType($this->offsetType)), []);
+	}
+
+	public function isSuperTypeOf(Type $type): IsSuperTypeOfResult
+	{
+		if ($this->equals($type)) {
+			return IsSuperTypeOfResult::createYes();
+		}
+		return new IsSuperTypeOfResult($type->isOffsetAccessible()->and($type->hasOffsetValueType($this->offsetType)), []);
+	}
+
+	public function isSubTypeOf(Type $otherType): IsSuperTypeOfResult
+	{
+		if ($otherType instanceof UnionType || $otherType instanceof IntersectionType) {
+			return $otherType->isSuperTypeOf($this);
+		}
+
+		return new IsSuperTypeOfResult(
+			$otherType->isOffsetAccessible()->and($otherType->hasOffsetValueType($this->offsetType))->and($otherType instanceof self ? TrinaryLogic::createYes() : TrinaryLogic::createMaybe()),
+			[],
+		);
+	}
+
+	public function isAcceptedBy(Type $acceptingType, bool $strictTypes): AcceptsResult
+	{
+		return $this->isSubTypeOf($acceptingType)->toAcceptsResult();
+	}
+
+	public function equals(Type $type): bool
+	{
+		return $type instanceof self
+			&& $this->offsetType->equals($type->offsetType);
+	}
+
+	public function describe(VerbosityLevel $level): string
+	{
+		return sprintf('hasOffset(%s)', $this->offsetType->describe($level));
+	}
+
+	public function isOffsetAccessible(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function isOffsetAccessLegal(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function hasOffsetValueType(Type $offsetType): TrinaryLogic
+	{
+		if ($offsetType->isConstantScalarValue()->yes() && $offsetType->equals($this->offsetType)) {
+			return TrinaryLogic::createYes();
+		}
+
+		return TrinaryLogic::createMaybe();
+	}
+
+	public function getOffsetValueType(Type $offsetType): Type
+	{
+		return new MixedType();
+	}
+
+	public function setOffsetValueType(?Type $offsetType, Type $valueType, bool $unionValues = true): Type
+	{
+		return $this;
+	}
+
+	public function setExistingOffsetValueType(Type $offsetType, Type $valueType): Type
+	{
+		return $this;
+	}
+
+	public function unsetOffset(Type $offsetType): Type
+	{
+		if ($this->offsetType->isSuperTypeOf($offsetType)->yes()) {
+			return new ErrorType();
+		}
+		return $this;
+	}
+
+	public function chunkArray(Type $lengthType, TrinaryLogic $preserveKeys): Type
+	{
+		return new NonEmptyArrayType();
+	}
+
+	public function fillKeysArray(Type $valueType): Type
+	{
+		return new NonEmptyArrayType();
+	}
+
+	public function intersectKeyArray(Type $otherArraysType): Type
+	{
+		if ($otherArraysType->hasOffsetValueType($this->offsetType)->yes()) {
+			return $this;
+		}
+
+		return new MixedType();
+	}
+
+	public function reverseArray(TrinaryLogic $preserveKeys): Type
+	{
+		if ($preserveKeys->yes()) {
+			return $this;
+		}
+
+		return new NonEmptyArrayType();
+	}
+
+	public function shuffleArray(): Type
+	{
+		return new NonEmptyArrayType();
+	}
+
+	public function sliceArray(Type $offsetType, Type $lengthType, TrinaryLogic $preserveKeys): Type
+	{
+		if (
+			$this->offsetType->isSuperTypeOf($offsetType)->yes()
+			&& ($lengthType->isNull()->yes() || IntegerRangeType::fromInterval(1, null)->isSuperTypeOf($lengthType)->yes())
+		) {
+			return $preserveKeys->yes()
+				? TypeCombinator::intersect($this, new NonEmptyArrayType())
+				: new NonEmptyArrayType();
+		}
+
+		return new MixedType();
+	}
+
+	public function spliceArray(Type $offsetType, Type $lengthType, Type $replacementType): Type
+	{
+		if ((new ConstantIntegerType(0))->isSuperTypeOf($lengthType)->yes()) {
+			return $this;
+		}
+
+		return new MixedType();
+	}
+
+	public function truncateListToSize(Type $sizeType): Type
+	{
+		// Having a specific offset is independent of the array's size bound.
+		return $this;
+	}
+
+	public function makeListMaybe(): Type
+	{
+		// Having an offset doesn't conflict with list-being-maybe.
+		return $this;
+	}
+
+	public function mapValueType(callable $cb): Type
+	{
+		// `HasOffsetType` only records that an offset exists, not its
+		// value; the assertion still holds after a value transformation.
+		return $this;
+	}
+
+	public function mapKeyType(callable $cb): Type
+	{
+		// Match the prior `TypeTraverser`-based pattern that left
+		// accessories untouched while rewriting the array key type.
+		return $this;
+	}
+
+	public function makeAllArrayKeysOptional(): Type
+	{
+		// "Has offset X" is no longer guaranteed when X is now optional.
+		return new MixedType();
+	}
+
+	public function changeKeyCaseArray(?int $case): Type
+	{
+		// A string offset is itself case-folded; an int offset is unchanged.
+		if (!$this->offsetType instanceof ConstantStringType) {
+			return $this;
+		}
+
+		$value = $this->offsetType->getValue();
+		if ($case === CASE_LOWER) {
+			return new self(new ConstantStringType(strtolower($value)));
+		}
+		if ($case === CASE_UPPER) {
+			return new self(new ConstantStringType(strtoupper($value)));
+		}
+
+		// Unknown case → could be either fold; the accessory weakens to
+		// "no specific offset known".
+		return new MixedType();
+	}
+
+	public function filterArrayRemovingFalsey(): Type
+	{
+		// We don't track the value at this offset, so we can't guarantee
+		// it survives a falsey filter. Drop the assertion.
+		return new MixedType();
+	}
+
+	public function isIterableAtLeastOnce(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function isList(): TrinaryLogic
+	{
+		if ($this->offsetType->isString()->yes()) {
+			return TrinaryLogic::createNo();
+		}
+
+		return TrinaryLogic::createMaybe();
+	}
+
+	public function isNull(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isConstantValue(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isConstantScalarValue(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function getConstantScalarTypes(): array
+	{
+		return [];
+	}
+
+	public function getConstantScalarValues(): array
+	{
+		return [];
+	}
+
+	public function isTrue(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isFalse(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isBoolean(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isFloat(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isInteger(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function getClassStringObjectType(): Type
+	{
+		return new ObjectWithoutClassType();
+	}
+
+	public function getObjectTypeOrClassStringObjectType(): Type
+	{
+		return new ObjectWithoutClassType();
+	}
+
+	public function isVoid(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function looseCompare(Type $type, PhpVersion $phpVersion): BooleanType
+	{
+		return new BooleanType();
+	}
+
+	public function getKeysArrayFiltered(Type $filterValueType, TrinaryLogic $strict): Type
+	{
+		return $this->getKeysArray();
+	}
+
+	public function getKeysArray(): Type
+	{
+		return new NonEmptyArrayType();
+	}
+
+	public function getValuesArray(): Type
+	{
+		return new NonEmptyArrayType();
+	}
+
+	public function toNumber(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toBitwiseNotType(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toAbsoluteNumber(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toInteger(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toFloat(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toString(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toArray(): Type
+	{
+		return new MixedType();
+	}
+
+	public function toArrayKey(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toCoercedArgumentType(bool $strictTypes): Type
+	{
+		return $this;
+	}
+
+	public function getEnumCases(): array
+	{
+		return [];
+	}
+
+	public function getEnumCaseObject(): ?EnumCaseObjectType
+	{
+		return null;
+	}
+
+	public function traverse(callable $cb): Type
+	{
+		return $this;
+	}
+
+	public function traverseSimultaneously(Type $right, callable $cb): Type
+	{
+		return $this;
+	}
+
+	public function exponentiate(Type $exponent): Type
+	{
+		return new ErrorType();
+	}
+
+	public function getFiniteTypes(): array
+	{
+		return [];
+	}
+
+	public function getDefaultBaseType(): Type
+	{
+		return new UnionType([
+			new ArrayType(new MixedType(), new MixedType()),
+			new ObjectType(ArrayAccess::class),
+		]);
+	}
+
+	public function toPhpDocNode(): TypeNode
+	{
+		return new IdentifierTypeNode(''); // no PHPDoc representation
+	}
+
+	public function hasTemplateOrLateResolvableType(): bool
+	{
+		return $this->offsetType->hasTemplateOrLateResolvableType();
+	}
+
+}
