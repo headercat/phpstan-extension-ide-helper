@@ -1,0 +1,41 @@
+<?php 
+
+namespace PHPStan\Type\Generic;
+return;
+
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\FloatType;
+use PHPStan\Type\Traits\UndecidedComparisonCompoundTypeTrait;
+use PHPStan\Type\Type;
+
+/** @api */
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/TemplateFloatType.cpp')]
+final class TemplateFloatType extends FloatType implements TemplateType
+{
+
+	/** @use TemplateTypeTrait<FloatType> */
+	use TemplateTypeTrait;
+	use UndecidedComparisonCompoundTypeTrait;
+
+	/**
+	 * @param non-empty-string $name
+	 */
+	public function __construct(
+		TemplateTypeScope $scope,
+		TemplateTypeStrategy $templateTypeStrategy,
+		TemplateTypeVariance $templateTypeVariance,
+		string $name,
+		FloatType $bound,
+		?Type $default,
+	)
+	{
+		parent::__construct();
+		$this->scope = $scope;
+		$this->strategy = $templateTypeStrategy;
+		$this->variance = $templateTypeVariance;
+		$this->name = $name;
+		$this->bound = $bound;
+		$this->default = $default;
+	}
+
+}

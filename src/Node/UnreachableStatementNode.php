@@ -1,0 +1,51 @@
+<?php 
+
+namespace PHPStan\Node;
+return;
+
+use Override;
+use PhpParser\Node\Stmt;
+use PHPStan\Turbo\ReferencedByTurboExtension;
+
+/**
+ * @api
+ */
+#[ReferencedByTurboExtension(key: 'unreachableStatementNode')]
+final class UnreachableStatementNode extends Stmt implements VirtualNode
+{
+
+	/** @param Stmt[] $nextStatements */
+	public function __construct(private Stmt $originalStatement, private array $nextStatements = [])
+	{
+		parent::__construct($originalStatement->getAttributes());
+	}
+
+	public function getOriginalStatement(): Stmt
+	{
+		return $this->originalStatement;
+	}
+
+	#[Override]
+	public function getType(): string
+	{
+		return 'PHPStan_Stmt_UnreachableStatementNode';
+	}
+
+	/**
+	 * @return string[]
+	 */
+	#[Override]
+	public function getSubNodeNames(): array
+	{
+		return [];
+	}
+
+	/**
+	 * @return Stmt[]
+	 */
+	public function getNextStatements(): array
+	{
+		return $this->nextStatements;
+	}
+
+}

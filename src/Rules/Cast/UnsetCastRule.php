@@ -1,0 +1,38 @@
+<?php 
+
+namespace PHPStan\Rules\Cast;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+
+/**
+ * @implements Rule<Node\Expr\Cast\Unset_>
+ */
+#[RegisteredRule(level: 0)]
+final class UnsetCastRule implements Rule
+{
+
+	public function getNodeType(): string
+	{
+		return Node\Expr\Cast\Unset_::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if ($scope->getPhpVersion()->supportsUnsetCast()->yes()) {
+			return [];
+		}
+
+		return [
+			RuleErrorBuilder::message('The (unset) cast is no longer supported in PHP 8.0 and later.')
+				->identifier('cast.unset')
+				->nonIgnorable()
+				->build(),
+		];
+	}
+
+}

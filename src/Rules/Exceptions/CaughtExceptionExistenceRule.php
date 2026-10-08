@@ -1,0 +1,88 @@
+<?php 
+
+namespace PHPStan\Rules\Exceptions;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\Stmt\Catch_;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Rules\ClassNameCheck;
+use PHPStan\Rules\ClassNameNodePair;
+use PHPStan\Rules\ClassNameUsageLocation;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use Throwable;
+use function array_merge;
+use function sprintf;
+
+/**
+ * @implements Rule<Node\Stmt\Catch_>
+ */
+#[RegisteredRule(level: 0)]
+final class CaughtExceptionExistenceRule implements Rule
+{
+
+	public function __construct(
+		private ReflectionProvider $reflectionProvider,
+		private ClassNameCheck $classCheck,
+		#[AutowiredParameter]
+		private bool $checkClassCaseSensitivity,
+		#[AutowiredParameter(ref: '%tips.discoveringSymbols%')]
+		private bool $discoveringSymbolsTip,
+	)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return Catch_::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		$errors = [];
+		foreach ($node->types as $class) {
+			$className = (string) $class;
+			if (!$this->reflectionProvider->hasClass($className)) {
+				if ($scope->isInClassExists($className)) {
+					continue;
+				}
+
+				$errorBuilder = RuleErrorBuilder::message(sprintf('Caught class %s not found.', $className))
+					->line($class->getStartLine())
+					->identifier('class.notFound');
+
+				if ($this->discoveringSymbolsTip) {
+					$errorBuilder->discoveringSymbolsTip();
+				}
+
+				$errors[] = $errorBuilder->build();
+				continue;
+			}
+
+			$classReflection = $this->reflectionProvider->getClass($className);
+			if (!$classReflection->isInterface() && !$classReflection->implementsInterface(Throwable::class)) {
+				$errors[] = RuleErrorBuilder::message(sprintf('Caught class %s is not an exception.', $classReflection->getDisplayName()))
+					->line($class->getStartLine())
+					->identifier('catch.notThrowable')
+					->build();
+			}
+
+			$errors = array_merge(
+				$errors,
+				$this->classCheck->checkClassNames(
+					$scope,
+					[new ClassNameNodePair($className, $class)],
+					ClassNameUsageLocation::from(ClassNameUsageLocation::EXCEPTION_CATCH),
+					$this->checkClassCaseSensitivity,
+				),
+			);
+		}
+
+		return $errors;
+	}
+
+}

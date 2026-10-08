@@ -1,0 +1,1309 @@
+<?php 
+
+namespace PHPStan\Analyser\ExprHandler;
+return;
+
+use Closure;
+use PhpParser\Node;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\PropertyFetch;
+use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Name;
+use PhpParser\Node\Scalar\String_;
+use PhpParser\Node\Stmt;
+use PHPStan\Analyser\ArgsResult;
+use PHPStan\Analyser\ArgumentsHandler;
+use PHPStan\Analyser\ArgumentsNormalizer;
+use PHPStan\Analyser\ClosureProcessor;
+use PHPStan\Analyser\ConditionalTypeResolver;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\ExpressionResult;
+use PHPStan\Analyser\ExpressionResultFactory;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\ExprHandler;
+use PHPStan\Analyser\ExprHandler\Helper\ClosureTypeResolver;
+use PHPStan\Analyser\ExprHandler\Helper\DefaultNarrowingHelper;
+use PHPStan\Analyser\ExprHandler\Helper\DynamicReturnTypeStoragePrimer;
+use PHPStan\Analyser\ExprHandler\Helper\EarlyTerminatingCallHelper;
+use PHPStan\Analyser\ExprHandler\Helper\FuncCallScopeEffectsHelper;
+use PHPStan\Analyser\Generics\ClosureSignatureInference;
+use PHPStan\Analyser\Generics\TemplateArgumentFrame;
+use PHPStan\Analyser\ImpurePoint;
+use PHPStan\Analyser\InternalThrowPoint;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\NoopNodeCallback;
+use PHPStan\Analyser\Scope;
+use PHPStan\Analyser\SpecifiedTypes;
+use PHPStan\Analyser\TypeSpecifier;
+use PHPStan\Analyser\TypeSpecifierContext;
+use PHPStan\Analyser\VariableFlow;
+use PHPStan\Analyser\VariableFlowBuilder;
+use PHPStan\Dependency\Dependencies;
+use PHPStan\Dependency\DependencyTypes;
+use PHPStan\DependencyInjection\AutowiredExtensions;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\DependencyInjection\ExtensionsCollection;
+use PHPStan\Node\ClosureReturnStatementsNode;
+use PHPStan\Node\Expr\TypeExpr;
+use PHPStan\Node\Printer\ExprPrinter;
+use PHPStan\Parser\ImmediatelyInvokedClosureVisitor;
+use PHPStan\Reflection\Callables\CallableParametersAcceptor;
+use PHPStan\Reflection\Callables\SimpleImpurePoint;
+use PHPStan\Reflection\Callables\SimpleThrowPoint;
+use PHPStan\Reflection\ExtendedParametersAcceptor;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\Reflection\Native\NativeParameterReflection;
+use PHPStan\Reflection\ParametersAcceptor;
+use PHPStan\Reflection\ParametersAcceptorSelector;
+use PHPStan\Reflection\PassedByReference;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Rules\Comparison\ImpossibleCheckTypeHelper;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\TrinaryLogic;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\Accessory\HasPropertyType;
+use PHPStan\Type\Accessory\NonEmptyArrayType;
+use PHPStan\Type\CallableType;
+use PHPStan\Type\ClosureType;
+use PHPStan\Type\Constant\ConstantBooleanType;
+use PHPStan\Type\DynamicFunctionThrowTypeExtension;
+use PHPStan\Type\DynamicReturnTypeExtensionRegistry;
+use PHPStan\Type\ErrorType;
+use PHPStan\Type\Generic\TemplateTypeHelper;
+use PHPStan\Type\Generic\TemplateTypeVariance;
+use PHPStan\Type\Generic\TemplateTypeVarianceMap;
+use PHPStan\Type\Generic\UnresolvedTemplateArgumentType;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\NullType;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use PHPStan\Type\UnionType;
+use Throwable;
+use WeakReference;
+use function array_filter;
+use function array_key_first;
+use function array_keys;
+use function array_map;
+use function array_merge;
+use function array_values;
+use function count;
+use function in_array;
+use function is_string;
+
+/**
+ * @implements ExprHandler<FuncCall>
+ */
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/FuncCallHandler.cpp')]
+final class FuncCallHandler implements ExprHandler
+{
+
+	/**
+	 * @param ExtensionsCollection<DynamicFunctionThrowTypeExtension> $dynamicFunctionThrowTypeExtensions
+	 */
+	public function __construct(
+		private ReflectionProvider $reflectionProvider,
+		#[AutowiredExtensions(of: DynamicFunctionThrowTypeExtension::class)]
+		private ExtensionsCollection $dynamicFunctionThrowTypeExtensions,
+		private DynamicReturnTypeExtensionRegistry $dynamicReturnTypeExtensionRegistry,
+		#[AutowiredParameter(ref: '%exceptions.implicitThrows%')]
+		private bool $implicitThrows,
+		#[AutowiredParameter]
+		private bool $rememberPossiblyImpureFunctionValues,
+		private FuncCallScopeEffectsHelper $scopeEffectsHelper,
+		private ExpressionResultFactory $expressionResultFactory,
+		private TypeSpecifier $typeSpecifier,
+		private DefaultNarrowingHelper $defaultNarrowingHelper,
+		private EarlyTerminatingCallHelper $earlyTerminatingHelper,
+		private DynamicReturnTypeStoragePrimer $storagePrimer,
+		private ImpossibleCheckTypeHelper $impossibleCheckTypeHelper,
+		private ClosureTypeResolver $closureTypeResolver,
+		private ArgumentsHandler $argumentsHandler,
+		private ClosureProcessor $closureProcessor,
+		private AssignHandler $assignHandler,
+		private ClosureSignatureInference $closureSignatureInference,
+	)
+	{
+	}
+
+	public function supports(Expr $expr): bool
+	{
+		return $expr instanceof FuncCall && !$expr->isFirstClassCallable();
+	}
+
+	public function processExpr(NodeScopeResolver $nodeScopeResolver, Stmt $stmt, Expr $expr, MutatingScope $scope, ExpressionResultStorage $storage, callable $nodeCallback, ExpressionContext $context): ExpressionResult
+	{
+		$beforeScope = $scope;
+		$parametersAcceptor = null;
+		$nameType = null;
+		$variants = [];
+		$namedArgumentsVariants = null;
+		$functionReflection = null;
+		$nameResult = null;
+		$throwPoints = [];
+		$impurePoints = [];
+		// A call configured as early-terminating never returns: give it an explicit
+		// never so the statement's exit point follows from the result type, instead of
+		// NodeScopeResolver re-deriving it via Scope::getType().
+		$isEarlyTerminating = $expr->name instanceof Name
+			&& $this->earlyTerminatingHelper->isEarlyTerminatingFunctionCall($expr->name->toString());
+		$hasYield = false;
+		$isAlwaysTerminating = $isEarlyTerminating;
+		$argumentsWalkedAhead = null;
+		if (
+			($expr->name instanceof Expr\Closure || $expr->name instanceof Expr\ArrowFunction)
+			&& $expr->name->getAttribute(ImmediatelyInvokedClosureVisitor::ARGS_ATTRIBUTE_NAME) !== null
+		) {
+			// An immediately invoked closure's untyped parameters take the types
+			// of its invocation arguments, so the arguments are walked BEFORE the
+			// callee - on the closure's declared signature - and the closure body
+			// consumes their stored results instead of pricing them ahead of
+			// their turn. The closure is then walked on the post-argument scope.
+			$shallowVariants = $this->closureTypeResolver->getDeclaredClosureType($scope, $expr->name)->getCallableParametersAcceptors($scope);
+			$shallowAcceptor = ParametersAcceptorSelector::combineVariantsForNormalization($expr->getArgs(), $shallowVariants, null);
+			$argumentsWalkedAhead = $this->argumentsHandler->processArgs($nodeScopeResolver, $stmt, null, null, $shallowVariants, null, ArgumentsNormalizer::reorderFuncArguments($shallowAcceptor, $expr) ?? $expr, $scope, $storage, $nodeCallback, $context);
+			$scope = $argumentsWalkedAhead->getScope();
+		}
+		if ($expr->name instanceof Expr) {
+			// process the dynamic callee name first, then consume its type (single-pass
+			// inside-out) rather than reading it before processExprNode() stores it
+			$nameResult = $nodeScopeResolver->processExprNode($stmt, $expr->name, $scope, $storage, $nodeCallback, $context->enterDeep());
+			$nameType = $nameResult->getType();
+			if (!$nameType->isCallable()->no()) {
+				$variants = $nameType->getCallableParametersAcceptors($scope);
+				// A structural acceptor (names/positions/variadic) drives the per-arg
+				// metadata and the throw/impure points - generics are resolved
+				// type-driven by processArgs() into $resolvedParametersAcceptor.
+				$parametersAcceptor = ParametersAcceptorSelector::combineVariantsForNormalization($expr->getArgs(), $variants, null);
+			}
+
+			$scope = $nameResult->getScope();
+			$hasYield = $nameResult->hasYield();
+			$throwPoints = $nameResult->getThrowPoints();
+			$impurePoints = $nameResult->getImpurePoints();
+			$isAlwaysTerminating = $nameResult->isAlwaysTerminating();
+			if ( // phpcs:ignore
+				$nameType->isObject()->yes()
+				&& $nameType->isCallable()->yes()
+				&& (new ObjectType(Closure::class))->isSuperTypeOf($nameType)->no()
+			) {
+				// processed later
+			} elseif ($parametersAcceptor instanceof CallableParametersAcceptor) {
+				$callableThrowPoints = array_map(static fn (SimpleThrowPoint $throwPoint) => $throwPoint->isExplicit() ? InternalThrowPoint::createExplicit($scope, $throwPoint->getType(), $expr, $throwPoint->canContainAnyThrowable()) : InternalThrowPoint::createImplicit($scope, $expr), $parametersAcceptor->getThrowPoints());
+				if (!$this->implicitThrows) {
+					$callableThrowPoints = array_values(array_filter($callableThrowPoints, static fn (InternalThrowPoint $throwPoint) => $throwPoint->isExplicit()));
+				}
+				$throwPoints = array_merge($throwPoints, $callableThrowPoints);
+				// A callable value's impure points are resolved from its
+				// ParametersAcceptor alone, so a conditionally pure function reached
+				// through a first-class callable arrives here as an unconditional
+				// "possibly impure" point. The arguments are known at this call site,
+				// so settle the verdict here.
+				$callableImpurePoints = SimpleImpurePoint::narrowByConditionalPurity($parametersAcceptor->getImpurePoints(), $parametersAcceptor, $scope, $expr->getArgs());
+				$impurePoints = array_merge($impurePoints, array_map(static fn (SimpleImpurePoint $impurePoint) => new ImpurePoint($scope, $expr, $impurePoint->getIdentifier(), $impurePoint->getDescription(), $impurePoint->isCertain()), $callableImpurePoints));
+
+				$scope = $this->closureProcessor->processImmediatelyCalledCallable($scope, $parametersAcceptor->getInvalidateExpressions(), $parametersAcceptor->getUsedVariables());
+			}
+		} elseif ($this->reflectionProvider->hasFunction($expr->name, $scope)) {
+			$functionReflection = $this->reflectionProvider->getFunction($expr->name, $scope);
+			$variants = $functionReflection->getVariants();
+			$namedArgumentsVariants = $functionReflection->getNamedArgumentsVariants();
+			// A structural acceptor (names/positions/variadic) drives argument
+			// normalization, the impure point and the throw points - generics are
+			// resolved type-driven by processArgs() into $resolvedParametersAcceptor.
+			$parametersAcceptor = ParametersAcceptorSelector::combineVariantsForNormalization($expr->getArgs(), $variants, $namedArgumentsVariants);
+		} else {
+			$impurePoints[] = new ImpurePoint(
+				$scope,
+				$expr,
+				'functionCall',
+				'call to unknown function',
+				false,
+			);
+		}
+
+		$normalizedExpr = $expr;
+		if ($parametersAcceptor !== null) {
+			$normalizedExpr = ArgumentsNormalizer::reorderFuncArguments($parametersAcceptor, $expr) ?? $expr;
+			$returnType = $parametersAcceptor->getReturnType();
+			$isAlwaysTerminating = $isAlwaysTerminating || $returnType instanceof NeverType && $returnType->isExplicit();
+		}
+
+		if (
+			$normalizedExpr->name instanceof Name
+			&& $functionReflection !== null
+			&& $functionReflection->getName() === 'clone'
+			&& count($normalizedExpr->getArgs()) === 2
+		) {
+			// process the clone arguments as reads so the cloned object and the
+			// properties array resolve from stored results instead of unprocessed
+			// nodes; processArgs() below processes them again as clone()'s arguments,
+			// so the NoopNodeCallback here avoids duplicate node-callbacks.
+			$cloneObjectArgResult = $nodeScopeResolver->processExprNode($stmt, $normalizedExpr->getArgs()[0]->value, $scope, $storage, new NoopNodeCallback(), $context->enterDeep()->withoutTemplateArgumentResolution());
+			$clonePropertiesArgResult = $nodeScopeResolver->processExprNode($stmt, $normalizedExpr->getArgs()[1]->value, $scope, $storage, new NoopNodeCallback(), $context->enterDeep()->withoutTemplateArgumentResolution());
+			$clonePropertiesArgType = $clonePropertiesArgResult->getType();
+			// the cloned type is composed from the object argument's result -
+			// no synthetic Clone_ walk
+			$cloneExpr = new TypeExpr(CloneHandler::resolveCloneType($cloneObjectArgResult->getType()));
+			$clonePropertiesArgTypeConstantArrays = $clonePropertiesArgType->getConstantArrays();
+			foreach ($clonePropertiesArgTypeConstantArrays as $clonePropertiesArgTypeConstantArray) {
+				foreach ($clonePropertiesArgTypeConstantArray->getKeyTypes() as $i => $clonePropertyKeyType) {
+					$clonePropertyKeyTypeScalars = $clonePropertyKeyType->getConstantScalarValues();
+					$propertyAttributes = $normalizedExpr->getAttributes();
+					unset($propertyAttributes[ExprPrinter::ATTRIBUTE_CACHE_KEY]);
+					$propertyAttributes['inCloneWith'] = true;
+					if (count($clonePropertyKeyTypeScalars) === 1) {
+						$this->assignHandler->processVirtualAssign(
+							$nodeScopeResolver,
+							$scope,
+							$storage,
+							$stmt,
+							new PropertyFetch($cloneExpr, (string) $clonePropertyKeyTypeScalars[0], $propertyAttributes),
+							new TypeExpr($clonePropertiesArgTypeConstantArray->getValueTypes()[$i]),
+							$nodeCallback,
+						);
+						continue;
+					}
+
+					$this->assignHandler->processVirtualAssign(
+						$nodeScopeResolver,
+						$scope,
+						$storage,
+						$stmt,
+						new PropertyFetch($cloneExpr, new TypeExpr($clonePropertyKeyType), $propertyAttributes),
+						new TypeExpr($clonePropertiesArgTypeConstantArray->getValueTypes()[$i]),
+						$nodeCallback,
+					);
+				}
+			}
+		}
+
+		/** @var array{Type, Type}|null $arrayWalkValueTypes */
+		$arrayWalkValueTypes = null;
+		$arrayWalkArrayArg = null;
+		$argsGatherer = null;
+		if (
+			$functionReflection !== null
+			&& $functionReflection->getName() === 'array_walk'
+			&& count($normalizedExpr->getArgs()) >= 2
+		) {
+			$callbackArg = $normalizedExpr->getArgs()[1]->value;
+			$firstParamName = null;
+
+			if (
+				$callbackArg instanceof Expr\Closure
+				&& isset($callbackArg->params[0])
+				&& $callbackArg->params[0]->byRef
+				&& $callbackArg->params[0]->var instanceof Variable
+				&& is_string($callbackArg->params[0]->var->name)
+			) {
+				$firstParamName = $callbackArg->params[0]->var->name;
+			}
+
+			if ($firstParamName !== null) {
+				$arrayWalkArrayArg = $normalizedExpr->getArgs()[0]->value;
+
+				$argsGatherer = static function (Node $node, Scope $scope) use ($callbackArg, $firstParamName, &$arrayWalkValueTypes): void {
+					if (!($node instanceof ClosureReturnStatementsNode) || $node->getClosureExpr() !== $callbackArg) {
+						return;
+					}
+
+					$types = [];
+					$nativeTypes = [];
+					$stmtResult = $node->getStatementResult();
+					foreach ($stmtResult->getExitPoints() as $exitPoint) {
+						$exitScope = $exitPoint->getScope();
+						if (!$exitScope->hasVariableType($firstParamName)->yes()) {
+							continue;
+						}
+
+						$types[] = $exitScope->getVariableType($firstParamName);
+						$nativeTypes[] = $exitScope->toWalkScope()->doNotTreatPhpDocTypesAsCertain()->getVariableType($firstParamName);
+					}
+					if (!$stmtResult->isAlwaysTerminating()) {
+						$stmtScope = $stmtResult->getScope();
+						if ($stmtScope->hasVariableType($firstParamName)->yes()) {
+							$types[] = $stmtScope->getVariableType($firstParamName);
+							$nativeTypes[] = $stmtScope->toWalkScope()->doNotTreatPhpDocTypesAsCertain()->getVariableType($firstParamName);
+						}
+					}
+					if (count($types) <= 0) {
+						return;
+					}
+
+					$arrayWalkValueTypes = [
+						TypeCombinator::union(...$types),
+						TypeCombinator::union(...$nativeTypes),
+					];
+				};
+			}
+		}
+
+		$scopeBeforeArgs = $scope;
+		if ($parametersAcceptor !== null && $context->getInAssignRightSideExpr() === $expr) {
+			$context = $context->enterAssignRightSideCallArgs($parametersAcceptor);
+		}
+		if ($argsGatherer !== null) {
+			$nodeScopeResolver->pushNodeGatherer($argsGatherer);
+		}
+		try {
+			$argsResult = $argumentsWalkedAhead !== null
+				// the arguments are processed; the call resolves from the walked
+				// closure's acceptor, which is the sole variant of its type
+				? $argumentsWalkedAhead->withResolvedParametersAcceptor($parametersAcceptor)
+				: $this->argumentsHandler->processArgs($nodeScopeResolver, $stmt, $functionReflection, null, $variants, $namedArgumentsVariants, $normalizedExpr, $scope, $storage, $nodeCallback, $context);
+		} finally {
+			if ($argsGatherer !== null) {
+				$nodeScopeResolver->popNodeGatherer();
+			}
+		}
+		$resolvedParametersAcceptor = $argsResult->getResolvedParametersAcceptor();
+		if (
+			$resolvedParametersAcceptor !== null
+			&& $nameResult !== null
+			&& $expr->name instanceof Expr\Variable
+			&& is_string($expr->name->name)
+		) {
+			$invokedClosureType = $this->resolveInvokedClosureType($nodeScopeResolver, $normalizedExpr, $expr->name->name, $nameResult->getType(), $argsResult->getScope(), $storage);
+			if ($invokedClosureType !== null) {
+				$resolvedParametersAcceptor = $invokedClosureType->getCallableParametersAcceptors($scope)[0];
+			}
+		}
+		// arguments walked ahead of the callee: the scope already carries them
+		// and the callee walk's own effects (a closure's by-ref uses) on top
+		if ($argumentsWalkedAhead === null) {
+			$scope = $argsResult->getScope();
+		}
+		$this->argumentsHandler->processDroppedArgs($nodeScopeResolver, $stmt, $expr, $normalizedExpr, $scope, $storage, $context);
+		$hasYield = $hasYield || $argsResult->hasYield();
+		$throwPoints = array_merge($throwPoints, $argsResult->getThrowPoints());
+		$impurePoints = array_merge($impurePoints, $argsResult->getImpurePoints());
+		$isAlwaysTerminating = $isAlwaysTerminating || $argsResult->isAlwaysTerminating();
+
+		if ($functionReflection !== null) {
+			// created after the args were processed - the side-effect flip
+			// parameters (print_r's $return, ...) read an argument's type, which
+			// is only available once its result is stored
+			$impurePoint = SimpleImpurePoint::createFromVariant($functionReflection, $parametersAcceptor, $scope, $expr->getArgs());
+			if ($impurePoint !== null) {
+				$impurePoints[] = new ImpurePoint($scopeBeforeArgs, $expr, $impurePoint->getIdentifier(), $impurePoint->getDescription(), $impurePoint->isCertain());
+			}
+		}
+
+		if ($arrayWalkValueTypes !== null && $arrayWalkArrayArg !== null) {
+			$scope = $this->scopeEffectsHelper->applyArrayWalkResult($nodeScopeResolver, $stmt, $arrayWalkArrayArg, $arrayWalkValueTypes, $argsResult, $scope, $storage, $nodeCallback);
+		}
+
+		// The return type is derived from $resolvedParametersAcceptor - the acceptor
+		// processArgs() selected from the arg types gathered on the arg-to-arg
+		// evolving scope (type-driven, generics resolved). When null
+		// (native-types-promoted, on-demand / synthetic pricing, or special cases
+		// inside resolveReturnType), the acceptor is re-derived from the
+		// already-processed argument results on the asking scope.
+		$storageRef = WeakReference::create($storage);
+		$typeCallback = $isEarlyTerminating
+			? static fn (bool $nativeTypesPromoted): Type => new NeverType(true)
+			: function (bool $nativeTypesPromoted) use ($nodeScopeResolver, $beforeScope, $expr, $nameResult, $resolvedParametersAcceptor, $argsResult, $storageRef): Type {
+				// for always-true/always-false type checks the call's own narrowing
+				// (already produced as this result's specifyTypesCallback) decides
+				// the return type - the verdict is a read of that narrowing, not a
+				// second derivation. The result is looked up through a weak storage
+				// reference: this callback is owned by that very result, and a
+				// strong backedge would be a cycle (PHPStan runs with gc_disable()).
+				if (
+					!$nativeTypesPromoted
+					&& $expr->name instanceof Name
+					&& in_array($expr->name->toLowerString(), ['array_key_exists', 'key_exists', 'in_array', 'is_subclass_of'], true)
+				) {
+					$callStorage = $storageRef->get();
+					$callResult = $callStorage === null ? null : $callStorage->findExpressionResult($expr);
+					if ($callResult !== null) {
+						$isAlways = $this->impossibleCheckTypeHelper->findSpecifiedType($beforeScope, $expr, $callResult, $argsResult);
+						if ($isAlways !== null) {
+							return new ConstantBooleanType($isAlways);
+						}
+					}
+				}
+
+				return $this->resolveReturnType(
+					$nodeScopeResolver,
+					$beforeScope,
+					$nativeTypesPromoted,
+					$expr,
+					$nameResult,
+					$nativeTypesPromoted ? null : $resolvedParametersAcceptor,
+					$argsResult,
+				);
+			};
+		$specifyTypesCallback = fn (TypeSpecifierContext $specifyContext, bool $nativeTypesPromoted): SpecifiedTypes => $this->specifyTypes(
+			$nativeTypesPromoted ? $beforeScope->doNotTreatPhpDocTypesAsCertain() : $beforeScope,
+			$expr,
+			$normalizedExpr,
+			$nameResult,
+			$resolvedParametersAcceptor,
+			$specifyContext,
+			$argsResult,
+		);
+
+		// A type constraint on a (narrowable, i.e. non-side-effecting, non-first-class)
+		// function call narrows the call itself - the inside-out equivalent of
+		// createForExpr's FuncCall purity gate + tail entry. An impure call narrows to
+		// nothing.
+		$createTypesCallback = function (Type $type, TypeSpecifierContext $createContext, bool $nativeTypesPromoted) use ($expr, $normalizedExpr, $nameResult, $beforeScope, $argsResult): SpecifiedTypes {
+			$s = $nativeTypesPromoted ? $beforeScope->doNotTreatPhpDocTypesAsCertain() : $beforeScope;
+			if (!$this->isFuncCallNarrowable($s, $expr, $nameResult)) {
+				return new SpecifiedTypes([], []);
+			}
+
+			$types = $this->defaultNarrowingHelper->createSubjectTypes($s, $expr, null, $type, $createContext);
+
+			// array_key_first/array_key_last/array_find_key return null iff the
+			// array has no matching key - a null constraint on the call narrows
+			// the array argument (both directions for first/last, non-empty only
+			// for find_key: an empty result does not mean an empty array)
+			if (
+				$expr->name instanceof Name
+				&& !$expr->isFirstClassCallable()
+				&& isset($normalizedExpr->getArgs()[0])
+				&& $type->isNull()->yes()
+			) {
+				$funcName = $expr->name->toLowerString();
+				$bothDirections = in_array($funcName, ['array_key_first', 'array_key_last'], true);
+				if ($bothDirections || $funcName === 'array_find_key') {
+					// the normalized arguments are the ones processArgs() walked
+					$argExpr = $normalizedExpr->getArgs()[0]->value;
+					$argType = $argsResult->requireArgResult($argExpr)->getTypeOnScope($s, $s->nativeTypesPromoted);
+					if ($argType->isArray()->yes() && ($bothDirections || $createContext->falsey())) {
+						$types = $types->unionWith(
+							$this->defaultNarrowingHelper->createForSubject($argExpr, new NonEmptyArrayType(), $createContext->negate(), $s),
+						);
+					}
+				}
+			}
+
+			return $types;
+		};
+
+		// Store a preliminary result carrying the type/specify callbacks before the
+		// throw-point return type is computed: getFunctionThrowPoint() resolves the
+		// return type through the typeCallback, whose type-check verdict reads this
+		// very result's narrowing, and dynamic return type extensions may ask about
+		// the call too. Without a stored result those asks would re-process this
+		// FuncCall on demand and recurse back into getFunctionThrowPoint(). The
+		// callbacks are scope-independent, so the preliminary result answers those
+		// asks correctly; finalize() below completes it with the resolved scope and
+		// throw/impure points.
+		$preliminaryResult = $this->expressionResultFactory->create(
+			$scope,
+			beforeScope: $beforeScope,
+			expr: $expr,
+			hasYield: $hasYield,
+			isAlwaysTerminating: $isAlwaysTerminating,
+			throwPoints: [],
+			impurePoints: [],
+			typeCallback: $typeCallback,
+			specifyTypesCallback: $specifyTypesCallback,
+			createTypesCallback: $createTypesCallback,
+			argsResult: $argsResult,
+		);
+		$nodeScopeResolver->storeExpressionResult($storage, $expr, $preliminaryResult);
+
+		if ($normalizedExpr->name instanceof Expr) {
+			$nameType = $nodeScopeResolver->readStoredResult($normalizedExpr->name, $storage)->getTypeOnScope($scope, false);
+			if (
+				$nameType->isObject()->yes()
+				&& $nameType->isCallable()->yes()
+				&& (new ObjectType(Closure::class))->isSuperTypeOf($nameType)->no()
+			) {
+				$invokeAttributes = $normalizedExpr->getAttributes();
+				unset($invokeAttributes[ExprPrinter::ATTRIBUTE_CACHE_KEY]);
+				$invokeResult = $nodeScopeResolver->processExprNode(
+					$stmt,
+					new MethodCall($normalizedExpr->name, '__invoke', $normalizedExpr->getArgs(), $invokeAttributes),
+					$scope,
+					$storage,
+					new NoopNodeCallback(),
+					$context->enterDeep(),
+				);
+				$throwPoints = array_merge($throwPoints, $invokeResult->getThrowPoints());
+				$impurePoints = array_merge($impurePoints, $invokeResult->getImpurePoints());
+				$isAlwaysTerminating = $isAlwaysTerminating || $invokeResult->isAlwaysTerminating();
+			}
+		}
+
+		if ($functionReflection !== null) {
+			// The call's return type, computed from the already-processed argument
+			// results (resolveReturnType reads them from the stored results,
+			// never re-running processArgs) - asking Scope::getType() for the
+			// FuncCall here would re-enter this handler on demand, as its result is
+			// not stored yet.
+			// Resolve it through the stored preliminary result so the memoized
+			// value seeds the final result below - the first later type read
+			// would otherwise run resolveReturnType() again.
+			$returnType = $preliminaryResult->getKeepVoidType(false);
+			// The early structural check above (line ~180) only sees the unresolved
+			// acceptor return type; a conditional-return never (e.g.
+			// `($x is Foo ? never : string)`) only resolves to never once the actual
+			// argument types are folded in by the type-driven resolved acceptor. Read
+			// it from that acceptor's return type, not resolveReturnType(), which
+			// folds in call_user_func()/dynamic-extension special cases that must not
+			// make the call itself always-terminating (e.g.
+			// `call_user_func(fn() => exit())`).
+			if ($resolvedParametersAcceptor !== null) {
+				$resolvedReturnType = $resolvedParametersAcceptor->getReturnType();
+				$isAlwaysTerminating = $isAlwaysTerminating || ($resolvedReturnType instanceof NeverType && $resolvedReturnType->isExplicit());
+			}
+			$functionThrowPoint = $this->getFunctionThrowPoint($functionReflection, $parametersAcceptor, $returnType, $normalizedExpr, $scope, $context);
+			if ($functionThrowPoint !== null) {
+				$throwPoints[] = $functionThrowPoint;
+			}
+		} else {
+			$throwPoints[] = InternalThrowPoint::createImplicit($scope, $expr);
+		}
+
+		$byRefWrittenNames = [];
+		if ($nameType !== null) {
+			if ($nodeScopeResolver->observingTemplateArgumentFrame($scope) !== null) {
+				$scope = $scope->addTemplateArgumentConstraints(ClosureSignatureInference::collectInvokedCallee($nameType));
+			}
+			[$scope, $byRefThrowPoints, $byRefWrittenNames] = $this->processByRefInvocations($nodeScopeResolver, $normalizedExpr, $nameType, $scope, $storage);
+			$throwPoints = array_merge($throwPoints, $byRefThrowPoints);
+		}
+
+		$scope = $this->scopeEffectsHelper->applyCallScopeEffects($nodeScopeResolver, $stmt, $normalizedExpr, $functionReflection, $parametersAcceptor, $argsResult, $scope, $scopeBeforeArgs, $storage, $nodeCallback);
+
+		// the invoked closure reads and writes its by-ref variables here
+		$byRefFlows = [];
+		foreach ($byRefWrittenNames as $byRefWrittenName) {
+			$byRefFlows[] = VariableFlow::escape($byRefWrittenName);
+		}
+		$byRefFlow = $byRefFlows === [] ? null : VariableFlow::sequence(...$byRefFlows);
+		$variableFlow = VariableFlow::sequence(
+			$nameResult !== null ? $nameResult->getVariableFlow() : null,
+			VariableFlowBuilder::arguments($expr, $argsResult, $storage),
+			self::getCallVariableFlow($functionReflection !== null ? $functionReflection->getName() : null, $normalizedExpr, $argsResult, $scope),
+			VariableFlowBuilder::throws($expr, $throwPoints),
+			$byRefFlow,
+			$isAlwaysTerminating ? VariableFlow::exit(VariableFlow::STOP) : null,
+		);
+
+		$dependencies = Dependencies::merge(
+			$nameResult !== null ? $nameResult->getDependencies() : null,
+			$argsResult->getDependencies(),
+			$this->getDependencies($beforeScope, $functionReflection, $nameResult, $preliminaryResult),
+		);
+		return $preliminaryResult->finalize($scope, $hasYield, $isAlwaysTerminating, $throwPoints, $impurePoints, $variableFlow, $dependencies);
+	}
+
+	/**
+	 * Invoking a closure whose by-ref uses are followed to where it runs (see
+	 * ClosureSignatureInference): the by-ref variables take the body's exit
+	 * types here. Observing, the invocation's state joins the closure's entry
+	 * and the effects are the fixpoint from here, containing whatever the
+	 * second pass computes; there, a closure whose every invocation was seen
+	 * runs once, an escaped one converges again.
+	 *
+	 * @return array{MutatingScope, list<InternalThrowPoint>, list<string>}
+	 */
+	private function processByRefInvocations(NodeScopeResolver $nodeScopeResolver, FuncCall $call, Type $calleeType, MutatingScope $scope, ExpressionResultStorage $storage): array
+	{
+		$members = $calleeType instanceof UnionType ? $calleeType->getTypes() : [$calleeType];
+		$closureTypes = [];
+		$hasOtherMember = false;
+		foreach ($members as $member) {
+			if (!$member instanceof ClosureType) {
+				$hasOtherMember = true;
+				continue;
+			}
+			$byRefUseTypes = $member->getByRefUseTypes();
+			$marker = $byRefUseTypes[array_key_first($byRefUseTypes) ?? ''] ?? null;
+			if (!$marker instanceof UnresolvedTemplateArgumentType || !$marker->getSite() instanceof Expr\Closure) {
+				$hasOtherMember = true;
+				continue;
+			}
+			$closureTypes[] = [$member, $marker->getSite()];
+		}
+		if ($closureTypes === []) {
+			return [$scope, [], []];
+		}
+
+		$observing = $nodeScopeResolver->observingTemplateArgumentFrame($scope) !== null;
+		$argumentTypes = [];
+		foreach ($call->getArgs() as $i => $arg) {
+			if ($arg->name !== null || $arg->unpack) {
+				break;
+			}
+			$argumentTypes[$i] = $nodeScopeResolver->readTypeOfMaybeStored($arg->value, $scope);
+		}
+
+		$invocations = [];
+		$byRefNames = [];
+		foreach ($closureTypes as [$closureType, $site]) {
+			$mode = $observing ? null : $this->closureSignatureInference->getByRefSiteMode($scope, $site);
+			$creationScope = $observing || $mode !== null ? ClosureSignatureInference::findCreationScope($scope, $storage, $site) : null;
+			if ($creationScope === null) {
+				$hasOtherMember = true;
+				continue;
+			}
+			if ($observing || $mode === 'local') {
+				$scope = $scope->addTemplateArgumentConstraints(ClosureSignatureInference::collectInvocation($scope, $call, $closureType, $observing));
+			}
+			$invocations[] = [$site, $closureType, $creationScope, $mode !== 'local'];
+			foreach ($site->uses as $use) {
+				if (!$use->byRef || !is_string($use->var->name)) {
+					continue;
+				}
+				$byRefNames[$use->var->name] = true;
+			}
+		}
+
+		$resultScope = $hasOtherMember ? $scope : null;
+		$throwPoints = [];
+		foreach ($invocations as [$site, $closureType, $creationScope, $untilFixpoint]) {
+			$invokedScope = $observing ? $this->findCreationFixpointScope($scope, $storage, $site, $closureType, $argumentTypes) : null;
+			if ($invokedScope !== null) {
+				$resultScope = $resultScope === null ? $invokedScope : $resultScope->mergeWith($invokedScope);
+				continue;
+			}
+			[$invokedScope, $invocationThrowPoints] = $this->closureProcessor->processByRefInvocation(
+				$nodeScopeResolver,
+				$site,
+				$call,
+				$scope,
+				$storage,
+				$argumentTypes,
+				$creationScope,
+				$untilFixpoint,
+			);
+			$resultScope = $resultScope === null ? $invokedScope : $resultScope->mergeWith($invokedScope);
+			$throwPoints = array_merge($throwPoints, $invocationThrowPoints);
+		}
+
+		return [$resultScope ?? $scope, $throwPoints, array_keys($byRefNames)];
+	}
+
+	/**
+	 * While observing, the creation of the closure left its by-ref variables at
+	 * the fixpoint of any number of runs from where it was created. An
+	 * invocation from within that fixpoint - with arguments its parameters
+	 * accept, and nothing a catch could see in the middle of a run - adds
+	 * nothing to it, so the variables stay at it without walking the body.
+	 *
+	 * @param array<int, Type> $argumentTypes
+	 */
+	private function findCreationFixpointScope(MutatingScope $scope, ExpressionResultStorage $storage, Expr\Closure $site, ClosureType $closureType, array $argumentTypes): ?MutatingScope
+	{
+		if ($closureType->getThrowPoints() !== []) {
+			return null;
+		}
+		$creationResult = $storage->findExpressionResult($site);
+		if ($creationResult === null) {
+			return null;
+		}
+		foreach ($closureType->getParameters() as $i => $parameter) {
+			if (!isset($argumentTypes[$i])) {
+				continue;
+			}
+			if (!$parameter->getType()->isSuperTypeOf($argumentTypes[$i])->yes()) {
+				return null;
+			}
+		}
+
+		$fixpointScope = $creationResult->getScope();
+		foreach ($site->uses as $use) {
+			if (!$use->byRef || !is_string($use->var->name)) {
+				continue;
+			}
+			$name = $use->var->name;
+			if (!$fixpointScope->hasVariableType($name)->yes()) {
+				return null;
+			}
+			$fixpointType = $fixpointScope->getVariableType($name);
+			$type = $scope->hasVariableType($name)->yes() ? $scope->getVariableType($name) : new NullType();
+			if (!$fixpointType->isSuperTypeOf($type)->yes()) {
+				return null;
+			}
+			$scope = $scope->assignVariable($name, $fixpointType, $fixpointType, TrinaryLogic::createYes());
+		}
+
+		return $scope;
+	}
+
+	private function getFunctionThrowPoint(
+		FunctionReflection $functionReflection,
+		?ParametersAcceptor $parametersAcceptor,
+		Type $returnType,
+		FuncCall $normalizedFuncCall,
+		MutatingScope $scope,
+		ExpressionContext $context,
+	): ?InternalThrowPoint
+	{
+		foreach ($this->dynamicFunctionThrowTypeExtensions->getAll() as $extension) {
+			if (!$extension->isFunctionSupported($functionReflection)) {
+				continue;
+			}
+
+			$throwType = $extension->getThrowTypeFromFunctionCall($functionReflection, $normalizedFuncCall, $scope);
+			if ($throwType === null || $throwType->isVoid()->yes()) {
+				return null;
+			}
+
+			return InternalThrowPoint::createExplicit($scope, $throwType, $normalizedFuncCall, false);
+		}
+
+		$throwType = $functionReflection->getThrowType();
+		if ($throwType !== null && $parametersAcceptor !== null) {
+			$throwType = ConditionalTypeResolver::resolveForCall($throwType, $parametersAcceptor, $normalizedFuncCall->getArgs(), $scope);
+		}
+		if ($throwType === null) {
+			if ($returnType instanceof NeverType && $returnType->isExplicit()) {
+				$throwType = new ObjectType(Throwable::class);
+			}
+		}
+
+		if ($throwType !== null) {
+			if (!$throwType->isVoid()->yes()) {
+				return InternalThrowPoint::createExplicit($scope, $throwType, $normalizedFuncCall, true);
+			}
+		} elseif ($this->implicitThrows) {
+			$requiredParameters = null;
+			if ($parametersAcceptor !== null) {
+				$requiredParameters = 0;
+				foreach ($parametersAcceptor->getParameters() as $parameter) {
+					if ($parameter->isOptional()) {
+						continue;
+					}
+
+					$requiredParameters++;
+				}
+			}
+			if (
+				!$functionReflection->isBuiltin()
+				|| $requiredParameters === null
+				|| $requiredParameters > 0
+				|| count($normalizedFuncCall->getArgs()) > 0
+			) {
+				if (!$context->isInThrow() || !(new ObjectType(Throwable::class))->isSuperTypeOf($returnType)->yes()) {
+					return InternalThrowPoint::createImplicit($scope, $normalizedFuncCall);
+				}
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * The call-expression type is derived from $preResolvedAcceptor - the acceptor
+	 * processArgs() selected from the arg types gathered on the arg-to-arg evolving
+	 * scope (type-driven, generics resolved). When null (native-types-promoted, or
+	 * a callable callee whose name was processed elsewhere), it falls back to a
+	 * structural acceptor combined from the variants - generic resolution from the
+	 * actual arg types lives in $preResolvedAcceptor, recomputed by on-demand /
+	 * synthetic pricing that re-runs processArgs().
+	 *
+	 * @param FuncCall $expr
+	 */
+	private function resolveReturnType(NodeScopeResolver $nodeScopeResolver, MutatingScope $reflectionScope, bool $nativeTypesPromoted, Expr $expr, ?ExpressionResult $nameResult, ?ParametersAcceptor $preResolvedAcceptor, ArgsResult $argsResult): Type
+	{
+		// the operands/arguments were processed during processExpr; read their
+		// already computed results instead of re-walking via Scope::getType().
+		// The function reflection and dynamic-return-type extensions run on the
+		// reflection scope (the lexical context / beforeScope). Synthetic nodes the
+		// resolver builds (e.g. Clone_, call_user_func's inner FuncCall) are priced
+		// on demand by the same helper.
+		$getType = static function (Expr $e) use ($expr, $nameResult, $reflectionScope, $nodeScopeResolver, $argsResult, $nativeTypesPromoted): Type {
+			if ($nameResult !== null && $e === $expr->name) {
+				return $nativeTypesPromoted ? $nameResult->getNativeType() : $nameResult->getType();
+			}
+
+			$argResult = $argsResult->findArgResult($e);
+			if ($argResult !== null) {
+				return $nativeTypesPromoted ? $argResult->getNativeType() : $argResult->getType();
+			}
+
+			// Synthetic nodes (call_user_func's inner FuncCall, clone-with's Clone_)
+			// have no captured arg result; they are priced on demand.
+			$s = $nativeTypesPromoted ? $reflectionScope->doNotTreatPhpDocTypesAsCertain() : $reflectionScope;
+
+			return $nodeScopeResolver->processSyntheticOnDemand($e, $s)->getTypeOnScope($s, $s->nativeTypesPromoted);
+		};
+
+		if ($expr->name instanceof Expr) {
+			$calledOnType = $getType($expr->name);
+			if ($calledOnType->isCallable()->no()) {
+				return new ErrorType();
+			}
+
+			if ($preResolvedAcceptor !== null) {
+				$parametersAcceptor = $preResolvedAcceptor;
+			} else {
+				$variants = $calledOnType->getCallableParametersAcceptors($reflectionScope);
+				$parametersAcceptor = count($variants) === 1
+					? $variants[0]
+					: ParametersAcceptorSelector::combineAcceptors($variants);
+			}
+
+			// the same shortcut the named-function branch below takes: the native
+			// signature answers on its own, before any phpdoc-based dynamic
+			// return type extension gets a say
+			if ($nativeTypesPromoted && $parametersAcceptor instanceof ExtendedParametersAcceptor) {
+				return $parametersAcceptor->getNativeReturnType();
+			}
+
+			$functionName = null;
+			if ($expr->name instanceof String_) {
+				/** @var non-empty-string $name */
+				$name = $expr->name->value;
+				$functionName = new Name($name);
+			} elseif (
+				$expr->name instanceof FuncCall
+				&& $expr->name->name instanceof Name
+				&& $expr->name->isFirstClassCallable()
+			) {
+				$functionName = $expr->name->name;
+			}
+
+			$normalizedNode = ArgumentsNormalizer::reorderFuncArguments($parametersAcceptor, $expr);
+			if ($normalizedNode !== null && $functionName !== null && $this->reflectionProvider->hasFunction($functionName, $reflectionScope)) {
+				$functionReflection = $this->reflectionProvider->getFunction($functionName, $reflectionScope);
+				$resolvedType = $this->getDynamicFunctionReturnType($reflectionScope, $normalizedNode, $functionReflection, $argsResult);
+				if ($resolvedType !== null) {
+					return $resolvedType;
+				}
+			}
+
+			return TemplateArgumentFrame::returnTypeOfCall($parametersAcceptor, $reflectionScope, $expr);
+		}
+
+		if (!$this->reflectionProvider->hasFunction($expr->name, $reflectionScope)) {
+			return new ErrorType();
+		}
+
+		$functionReflection = $this->reflectionProvider->getFunction($expr->name, $reflectionScope);
+		if ($nativeTypesPromoted) {
+			return ParametersAcceptorSelector::combineAcceptors($functionReflection->getVariants())->getNativeReturnType();
+		}
+
+		if ($functionReflection->getName() === 'call_user_func') {
+			$result = ArgumentsNormalizer::reorderCallUserFuncArguments($expr, $reflectionScope);
+			if ($result !== null) {
+				[, $innerFuncCall] = $result;
+
+				return $getType($innerFuncCall);
+			}
+		}
+
+		if ($functionReflection->getName() === 'call_user_func_array') {
+			$result = ArgumentsNormalizer::reorderCallUserFuncArrayArguments($expr, $reflectionScope);
+			if ($result !== null) {
+				[, $innerFuncCall] = $result;
+
+				return $getType($innerFuncCall);
+			}
+		}
+
+		if ($preResolvedAcceptor !== null) {
+			$parametersAcceptor = $preResolvedAcceptor;
+		} else {
+			$variants = $functionReflection->getVariants();
+			$parametersAcceptor = count($variants) === 1
+				? $variants[0]
+				: ParametersAcceptorSelector::combineAcceptors($variants);
+		}
+		$normalizedNode = ArgumentsNormalizer::reorderFuncArguments($parametersAcceptor, $expr);
+		if ($normalizedNode !== null) {
+			if ($functionReflection->getName() === 'clone' && count($normalizedNode->getArgs()) > 0) {
+				$cloneType = $getType(new Expr\Clone_($normalizedNode->getArgs()[0]->value));
+				if (count($normalizedNode->getArgs()) === 2) {
+					$propertiesType = $getType($normalizedNode->getArgs()[1]->value);
+					if ($propertiesType->isConstantArray()->yes()) {
+						$constantArrays = $propertiesType->getConstantArrays();
+						if (count($constantArrays) === 1) {
+							$accessories = [];
+							foreach ($constantArrays[0]->getKeyTypes() as $keyType) {
+								$constantKeyTypes = $keyType->getConstantScalarValues();
+								if (count($constantKeyTypes) !== 1) {
+									return $cloneType;
+								}
+								$accessories[] = new HasPropertyType((string) $constantKeyTypes[0]);
+							}
+							if (count($accessories) > 0 && count($accessories) <= 16) {
+								return TypeCombinator::intersect($cloneType, ...$accessories);
+							}
+						}
+					}
+				}
+
+				return $cloneType;
+			}
+			$resolvedType = $this->getDynamicFunctionReturnType($reflectionScope, $normalizedNode, $functionReflection, $argsResult);
+			if ($resolvedType !== null) {
+				return $resolvedType;
+			}
+		}
+
+		// the typeCallback keeps void; ExpressionResult projects void->null for
+		// value reads, getKeepVoidType() keeps it
+		return TemplateArgumentFrame::returnTypeOfCall($parametersAcceptor, $reflectionScope, $expr);
+	}
+
+	/**
+	 * A closure whose signature is inferred from its invocations (see
+	 * ClosureSignatureInference) joins the arguments of all of them; invoked
+	 * with narrower ones, it returns what its body returns for these. The
+	 * variable holds the closure it was assigned when the type it holds is the
+	 * type the closure was created with.
+	 */
+	private function resolveInvokedClosureType(NodeScopeResolver $nodeScopeResolver, FuncCall $call, string $name, Type $calleeType, MutatingScope $scope, ExpressionResultStorage $storage): ?ClosureType
+	{
+		if (!$calleeType instanceof ClosureType || !$this->closureSignatureInference->infersInvocationReturnType($scope, $calleeType)) {
+			return null;
+		}
+		$parameters = $calleeType->getParameters();
+		$args = $call->getArgs();
+		if ($args === [] || count($args) > count($parameters)) {
+			return null;
+		}
+
+		$narrower = false;
+		$callableParameters = [];
+		foreach ($parameters as $i => $parameter) {
+			if ($parameter->isVariadic() || !$parameter->passedByReference()->no()) {
+				return null;
+			}
+			$type = $parameter->getType();
+			if (isset($args[$i])) {
+				if ($args[$i]->name !== null || $args[$i]->unpack) {
+					return null;
+				}
+				$argumentType = $nodeScopeResolver->readTypeOfMaybeStored($args[$i]->value, $scope);
+				// an argument the signature rejects is reported against it
+				if (!$type->isSuperTypeOf($argumentType)->yes()) {
+					return null;
+				}
+				if (!$argumentType->isSuperTypeOf($type)->yes()) {
+					$narrower = true;
+					$type = $argumentType;
+				}
+			}
+			$callableParameters[] = new NativeParameterReflection($parameter->getName(), $parameter->isOptional(), $type, PassedByReference::createNo(), false, null);
+		}
+		if (!$narrower) {
+			return null;
+		}
+
+		foreach ($this->closureSignatureInference->findAssignedClosures($scope, $name) as $closure) {
+			$creationResult = $storage->findExpressionResult($closure);
+			if ($creationResult === null || !$creationResult->getType()->equals($calleeType)) {
+				continue;
+			}
+			if ($closure instanceof Expr\Closure) {
+				foreach ($closure->uses as $use) {
+					// what it returns depends on its by-ref variables where it
+					// runs - see processByRefInvocations()
+					if ($use->byRef) {
+						return null;
+					}
+				}
+			}
+
+			return $this->closureTypeResolver->getClosureType($creationResult->getBeforeScope(), $closure, false, $storage, new CallableType($callableParameters, new MixedType(), false));
+		}
+
+		return null;
+	}
+
+	/**
+	 * The function the call calls by name, or the variants of the callable it calls, and the classes
+	 * in what the call returns.
+	 */
+	private function getDependencies(MutatingScope $scope, ?FunctionReflection $functionReflection, ?ExpressionResult $nameResult, ExpressionResult $result): ?Dependencies
+	{
+		$types = [$result->getType()];
+		$reflections = [];
+		if ($functionReflection !== null) {
+			$reflections[] = $functionReflection;
+			$types = [...$types, ...DependencyTypes::ofCalledVariants($functionReflection->getVariants()), ...DependencyTypes::ofAsserts($functionReflection->getAsserts())];
+		}
+		if ($nameResult !== null) {
+			$calleeType = $nameResult->getType();
+			if ($calleeType->isCallable()->yes()) {
+				foreach ($calleeType->getCallableParametersAcceptors($scope) as $variant) {
+					$types[] = $variant->getReturnType();
+					$types = [...$types, ...DependencyTypes::ofCalledParameters($variant->getParameters())];
+				}
+			}
+		}
+
+		return Dependencies::create($scope->getFile(), $types, reflections: $reflections);
+	}
+
+	/**
+	 * Ported inside-out from the old TypeResolvingExprHandler::specifyTypes(): the
+	 * FunctionTypeSpecifyingExtensions, conditional-return-type and @phpstan-assert
+	 * narrowing are invoked on the already-processed argument results. The acceptor
+	 * is $resolvedParametersAcceptor (type-driven, generics resolved by processArgs)
+	 * rather than re-selected from the args on the asking scope. The subject's own
+	 * default narrowing comes from DefaultNarrowingHelper instead of
+	 * TypeSpecifier::handleDefaultTruthyOrFalseyContext(), which would re-enter this
+	 * expression through TypeSpecifier::create().
+	 *
+	 * @param FuncCall $expr
+	 */
+	private function specifyTypes(MutatingScope $scope, Expr $expr, FuncCall $normalizedExpr, ?ExpressionResult $nameResult, ?ParametersAcceptor $resolvedParametersAcceptor, TypeSpecifierContext $context, ?ArgsResult $argsResult = null): SpecifiedTypes
+	{
+		if ($expr->name instanceof Name) {
+			if ($this->reflectionProvider->hasFunction($expr->name, $scope)) {
+				$functionReflection = $this->reflectionProvider->getFunction($expr->name, $scope);
+				$args = $expr->getArgs();
+
+				// runs lazily at narrowing-apply time - prime the storage with the
+				// argument results, see MethodCallHandler::specifyTypes()
+				$popPrimedStorage = $this->storagePrimer->pushPrimedStorage($scope, $argsResult);
+				try {
+					foreach ($this->typeSpecifier->getFunctionTypeSpecifyingExtensions() as $extension) {
+						if (!$extension->isFunctionSupported($functionReflection, $normalizedExpr, $context)) {
+							continue;
+						}
+
+						return $extension->specifyTypes($functionReflection, $normalizedExpr, $scope, $context);
+					}
+				} finally {
+					$popPrimedStorage();
+				}
+
+				if (count($args) > 0 && $resolvedParametersAcceptor !== null) {
+					$specifiedTypes = $this->defaultNarrowingHelper->specifyTypesFromConditionalReturnType($context, $expr, $resolvedParametersAcceptor, $scope);
+					if ($specifiedTypes !== null) {
+						return $specifiedTypes;
+					}
+				}
+
+				$assertions = $functionReflection->getAsserts();
+				if ($assertions->getAll() !== [] && $resolvedParametersAcceptor !== null) {
+					$asserts = $assertions->mapTypes(static fn (Type $type) => TemplateTypeHelper::resolveTemplateTypes(
+						$type,
+						$resolvedParametersAcceptor->getResolvedTemplateTypeMap(),
+						$resolvedParametersAcceptor instanceof ExtendedParametersAcceptor ? $resolvedParametersAcceptor->getCallSiteVarianceMap() : TemplateTypeVarianceMap::createEmpty(),
+						TemplateTypeVariance::createInvariant(),
+					));
+					$specifiedTypes = $this->defaultNarrowingHelper->specifyTypesFromAsserts($context, $expr, $asserts, $resolvedParametersAcceptor, $scope);
+					if ($specifiedTypes !== null) {
+						// the asserts narrow the arguments regardless; the call's OWN
+						// key is a remembered value and gets the same purity gate as
+						// the default narrowing below - an impure call (realpath())
+						// evaluated a second time must not read the first call's
+						// truthiness (mirrors the create() gate the old
+						// specifyTypesInCondition() reached for the self key)
+						return ($this->isFuncCallNarrowable($scope, $expr, $nameResult)
+							? $specifiedTypes->unionWith($this->defaultNarrowingHelper->specifyDefaultTypes($expr, $context))
+							: $specifiedTypes)
+							->setRootExpr($specifiedTypes->getRootExpr());
+					}
+				}
+			}
+
+			return $this->defaultFuncCallNarrowing($scope, $expr, $nameResult, $context);
+		}
+
+		$specifiedTypes = $this->specifyTypesFromCallableCall($context, $expr, $nameResult, $resolvedParametersAcceptor, $scope);
+		if ($specifiedTypes !== null) {
+			return $specifiedTypes;
+		}
+
+		return $this->defaultFuncCallNarrowing($scope, $expr, $nameResult, $context);
+	}
+
+	private function specifyTypesFromCallableCall(TypeSpecifierContext $context, FuncCall $call, ?ExpressionResult $nameResult, ?ParametersAcceptor $resolvedParametersAcceptor, MutatingScope $scope): ?SpecifiedTypes
+	{
+		if (!$call->name instanceof Expr) {
+			return null;
+		}
+
+		if ($nameResult === null) {
+			throw new ShouldNotHappenException();
+		}
+
+		$calleeType = $nameResult->getTypeOnScope($scope, $scope->nativeTypesPromoted);
+
+		$assertions = null;
+		$parametersAcceptor = null;
+		if ($calleeType->isCallable()->yes()) {
+			if ($resolvedParametersAcceptor !== null) {
+				$parametersAcceptor = $resolvedParametersAcceptor;
+			} else {
+				$variants = $calleeType->getCallableParametersAcceptors($scope);
+				$parametersAcceptor = count($variants) === 1
+					? $variants[0]
+					: ParametersAcceptorSelector::combineAcceptors($variants);
+			}
+			if ($parametersAcceptor instanceof CallableParametersAcceptor) {
+				$assertions = $parametersAcceptor->getAsserts();
+			}
+		}
+
+		if ($assertions === null || $assertions->getAll() === []) {
+			return null;
+		}
+
+		$asserts = $assertions->mapTypes(static fn (Type $type) => TemplateTypeHelper::resolveTemplateTypes(
+			$type,
+			$parametersAcceptor->getResolvedTemplateTypeMap(),
+			$parametersAcceptor instanceof ExtendedParametersAcceptor ? $parametersAcceptor->getCallSiteVarianceMap() : TemplateTypeVarianceMap::createEmpty(),
+			TemplateTypeVariance::createInvariant(),
+		));
+
+		return $this->defaultNarrowingHelper->specifyTypesFromAsserts($context, $call, $asserts, $parametersAcceptor, $scope);
+	}
+
+	/**
+	 * The default truthy/falsey narrowing of the call expression itself, gated by
+	 * the same purity check TypeSpecifier::create() applies: a function with side
+	 * effects (or an unknown / impure callee whose result is not remembered) is not
+	 * narrowable - calling it twice may yield different values - so it contributes
+	 * no entry. Mirrors create()'s FuncCall handling inside-out, without re-entering
+	 * this expression through create().
+	 *
+	 */
+	private function defaultFuncCallNarrowing(MutatingScope $scope, FuncCall $expr, ?ExpressionResult $nameResult, TypeSpecifierContext $context): SpecifiedTypes
+	{
+		if (!$this->isFuncCallNarrowable($scope, $expr, $nameResult)) {
+			return (new SpecifiedTypes([], []))->setRootExpr($expr);
+		}
+
+		return $this->defaultNarrowingHelper->specifyDefaultTypes($expr, $context);
+	}
+
+	private function isFuncCallNarrowable(MutatingScope $scope, FuncCall $expr, ?ExpressionResult $nameResult): bool
+	{
+		if ($expr->name instanceof Name) {
+			if (!$this->reflectionProvider->hasFunction($expr->name, $scope)) {
+				// backwards compatibility with previous behaviour
+				return false;
+			}
+
+			$hasSideEffects = $this->reflectionProvider->getFunction($expr->name, $scope)->hasSideEffects();
+			if ($hasSideEffects->yes()) {
+				return false;
+			}
+
+			return $this->rememberPossiblyImpureFunctionValues || $hasSideEffects->no();
+		}
+
+		if ($nameResult === null) {
+			throw new ShouldNotHappenException();
+		}
+
+		$nameType = $nameResult->getTypeOnScope($scope, $scope->nativeTypesPromoted);
+		if (!$nameType->isCallable()->yes()) {
+			return true;
+		}
+
+		$isPure = null;
+		foreach ($nameType->getCallableParametersAcceptors($scope) as $variant) {
+			$variantIsPure = $variant->isPure();
+			$isPure = $isPure === null ? $variantIsPure : $isPure->and($variantIsPure);
+		}
+
+		if ($isPure === null) {
+			return true;
+		}
+
+		if ($isPure->no()) {
+			return false;
+		}
+
+		return $this->rememberPossiblyImpureFunctionValues || $isPure->yes();
+	}
+
+	private function getDynamicFunctionReturnType(MutatingScope $scope, FuncCall $normalizedNode, FunctionReflection $functionReflection, ArgsResult $argsResult): ?Type
+	{
+		$extensions = $this->dynamicReturnTypeExtensionRegistry->getDynamicFunctionReturnTypeExtensions($functionReflection);
+
+		// re-expose the already-processed arguments so an extension's
+		// Scope::getType($arg->value) reads the stored result instead of re-walking
+		// the argument on demand (the call's argument storage frame is no longer
+		// current when the return type is asked lazily)
+		$popPrimedStorage = $this->storagePrimer->pushPrimedStorage($scope, $argsResult);
+		try {
+			foreach ($extensions as $dynamicFunctionReturnTypeExtension) {
+				$resolvedType = $dynamicFunctionReturnTypeExtension->getTypeFromFunctionCall(
+					$functionReflection,
+					$normalizedNode,
+					$scope,
+				);
+
+				if ($resolvedType !== null) {
+					return $resolvedType;
+				}
+			}
+		} finally {
+			$popPrimedStorage();
+		}
+
+		return null;
+	}
+
+	private static function getCallVariableFlow(?string $functionName, Expr\FuncCall $call, ArgsResult $args, MutatingScope $scope): ?VariableFlow
+	{
+		if (in_array($functionName, ['get_defined_vars', 'extract'], true)) {
+			return VariableFlow::all(VariableFlow::READ_ALL);
+		}
+		if (in_array($functionName, ['func_get_arg', 'func_get_args'], true)) {
+			return VariableFlow::all(VariableFlow::MENTION_ALL);
+		}
+		if ($functionName !== 'compact') {
+			return null;
+		}
+		$reads = [];
+		foreach ($call->getArgs() as $arg) {
+			if ($arg->unpack) {
+				return VariableFlow::all(VariableFlow::READ_ALL);
+			}
+			$names = self::compactNames($args->requireArgResult($arg->value)->getTypeOnScope($scope, false));
+			if ($names === null) {
+				return VariableFlow::all(VariableFlow::READ_ALL);
+			}
+			foreach ($names as $name) {
+				$reads[] = VariableFlow::read($name);
+			}
+		}
+		return VariableFlow::sequence(...$reads);
+	}
+
+	/** @return list<string>|null */
+	private static function compactNames(Type $type): ?array
+	{
+		$strings = $type->getConstantStrings();
+		if ($strings !== []) {
+			return array_map(static fn ($name) => $name->getValue(), $strings);
+		}
+		$arrays = $type->getConstantArrays();
+		if ($arrays === []) {
+			return null;
+		}
+		$names = [];
+		foreach ($arrays as $array) {
+			if ($array->isUnsealed()->yes()) {
+				return null;
+			}
+			foreach ($array->getValueTypes() as $value) {
+				$values = self::compactNames($value);
+				if ($values === null) {
+					return null;
+				}
+				foreach ($values as $name) {
+					$names[] = $name;
+				}
+			}
+		}
+		return $names;
+	}
+
+}

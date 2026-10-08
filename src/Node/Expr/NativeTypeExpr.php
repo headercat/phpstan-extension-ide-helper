@@ -1,0 +1,50 @@
+<?php 
+
+namespace PHPStan\Node\Expr;
+return;
+
+use Override;
+use PhpParser\Node\Expr;
+use PHPStan\Node\VirtualNode;
+use PHPStan\Turbo\ReferencedByTurboExtension;
+use PHPStan\Type\Type;
+
+/**
+ * @api
+ */
+#[ReferencedByTurboExtension(key: 'nativeTypeExpr')]
+final class NativeTypeExpr extends Expr implements VirtualNode
+{
+
+	/** @api */
+	public function __construct(private Type $phpdocType, private Type $nativeType)
+	{
+		parent::__construct();
+	}
+
+	public function getPhpDocType(): Type
+	{
+		return $this->phpdocType;
+	}
+
+	public function getNativeType(): Type
+	{
+		return $this->nativeType;
+	}
+
+	#[Override]
+	public function getType(): string
+	{
+		return 'PHPStan_Node_NativeTypeExpr';
+	}
+
+	/**
+	 * @return string[]
+	 */
+	#[Override]
+	public function getSubNodeNames(): array
+	{
+		return [];
+	}
+
+}
