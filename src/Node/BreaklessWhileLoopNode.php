@@ -1,0 +1,60 @@
+<?php 
+
+namespace PHPStan\Node;
+return;
+
+use Override;
+use PhpParser\Node\Stmt\While_;
+use PhpParser\NodeAbstract;
+use PHPStan\Analyser\StatementExitPoint;
+use PHPStan\Turbo\ReferencedByTurboExtension;
+
+/**
+ * @api
+ */
+#[ReferencedByTurboExtension(key: 'breaklessWhileLoopNode')]
+final class BreaklessWhileLoopNode extends NodeAbstract implements VirtualNode
+{
+
+	/**
+	 * @param StatementExitPoint[] $exitPoints
+	 */
+	public function __construct(private While_ $originalNode, private array $exitPoints, private bool $hasYield)
+	{
+		parent::__construct($originalNode->getAttributes());
+	}
+
+	public function getOriginalNode(): While_
+	{
+		return $this->originalNode;
+	}
+
+	/**
+	 * @return StatementExitPoint[]
+	 */
+	public function getExitPoints(): array
+	{
+		return $this->exitPoints;
+	}
+
+	public function hasYield(): bool
+	{
+		return $this->hasYield;
+	}
+
+	#[Override]
+	public function getType(): string
+	{
+		return 'PHPStan_Node_BreaklessWhileLoop';
+	}
+
+	/**
+	 * @return string[]
+	 */
+	#[Override]
+	public function getSubNodeNames(): array
+	{
+		return [];
+	}
+
+}

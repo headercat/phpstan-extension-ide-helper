@@ -1,0 +1,65 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use DateInterval;
+use PhpParser\Node\Expr\StaticCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Type\DynamicStaticMethodThrowTypeExtension;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use Throwable;
+use function count;
+
+#[AutowiredService]
+final class DateIntervalCreateFromDateStringThrowTypeExtension implements DynamicStaticMethodThrowTypeExtension
+{
+
+	public function isStaticMethodSupported(MethodReflection $methodReflection): bool
+	{
+		return $methodReflection->getName() === 'createFromDateString'
+			&& $methodReflection->getDeclaringClass()->getName() === DateInterval::class;
+	}
+
+	public function getThrowTypeFromStaticMethodCall(MethodReflection $methodReflection, StaticCall $methodCall, Scope $scope): ?Type
+	{
+		if (count($methodCall->getArgs()) === 0) {
+			return null;
+		}
+
+		if ($scope->getPhpVersion()->hasDateTimeExceptions()->no()) {
+			return null;
+		}
+
+		$valueType = $scope->getType($methodCall->getArgs()[0]->value);
+		$constantStrings = $valueType->getConstantStrings();
+
+		foreach ($constantStrings as $constantString) {
+			// createFromDateString() only throws since PHP 8.3, before that it warns and returns false.
+			// The analysed version can be 8.3+ while this process runs on an older one,
+			// so detect the failure through the return value instead of the exception.
+			try {
+				$result = @DateInterval::createFromDateString($constantString->getValue());
+			} catch (Throwable) {
+				$result = false;
+			}
+
+			if ($result === false) {
+				return $methodReflection->getThrowType();
+			}
+
+			$valueType = TypeCombinator::remove($valueType, $constantString);
+		}
+
+		if (!$valueType instanceof NeverType) {
+			return $methodReflection->getThrowType();
+		}
+
+		return null;
+	}
+
+}

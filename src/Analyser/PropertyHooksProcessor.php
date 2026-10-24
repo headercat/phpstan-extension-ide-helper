@@ -1,0 +1,185 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\ComplexType;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Identifier;
+use PhpParser\Node\Name;
+use PhpParser\Node\Stmt\Return_;
+use PhpParser\NodeTraverser;
+use PHPStan\Dependency\Dependencies;
+use PHPStan\Dependency\DependencyTypes;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Node\ExecutionEndNode;
+use PHPStan\Node\InPropertyHookNode;
+use PHPStan\Node\PropertyAssignNode;
+use PHPStan\Node\PropertyHookReturnStatementsNode;
+use PHPStan\Node\PropertyHookStatementNode;
+use PHPStan\Node\ReturnAfterFinallyNode;
+use PHPStan\Node\ReturnStatement;
+use PHPStan\Parser\LineAttributesVisitor;
+use PHPStan\Reflection\Php\PhpMethodFromParserNodeReflection;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\Type;
+use function array_merge;
+
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/PropertyHooksProcessor.cpp')]
+final class PropertyHooksProcessor
+{
+
+	public function __construct(
+		private DeprecatedAttributeResolver $deprecatedAttributeResolver,
+		private PhpDocsResolver $phpDocsResolver,
+		private AttributesHandler $attributesHandler,
+		private ParametersProcessor $parametersProcessor,
+	)
+	{
+	}
+
+	/**
+	 * @param Node\PropertyHook[] $hooks
+	 * @param callable(Node $node, Scope $scope): void $nodeCallback
+	 */
+	public function processPropertyHooks(
+		NodeScopeResolver $nodeScopeResolver,
+		Node\Stmt $stmt,
+		Identifier|Name|ComplexType|null $nativeTypeNode,
+		?Type $phpDocType,
+		string $propertyName,
+		array $hooks,
+		MutatingScope $scope,
+		ExpressionResultStorage $storage,
+		callable $nodeCallback,
+	): ?Dependencies
+	{
+		if (!$scope->isInClass()) {
+			throw new ShouldNotHappenException();
+		}
+
+		$dependencies = [];
+
+		$classReflection = $scope->getClassReflection();
+
+		foreach ($hooks as $hook) {
+			$nodeScopeResolver->callNodeCallback($nodeCallback, $hook, $scope, $storage);
+			$dependencies[] = $this->attributesHandler->processAttributeGroups($nodeScopeResolver, $stmt, $hook->attrGroups, $scope, $storage, $nodeCallback);
+
+			[, $phpDocParameterTypes,,,, $phpDocThrowType,,,,, $isPure,,, $phpDocComment,,,,,, $resolvedPhpDoc] = $this->phpDocsResolver->getPhpDocs($scope, $hook);
+
+			$dependencies[] = $this->parametersProcessor->processParams($nodeScopeResolver, $stmt, $hook->params, $scope, $storage, $nodeCallback);
+
+			[$isDeprecated, $deprecatedDescription] = $this->deprecatedAttributeResolver->getDeprecatedAttribute($scope, $hook);
+
+			$hookScope = $scope->enterPropertyHook(
+				$hook,
+				$propertyName,
+				$nativeTypeNode,
+				$phpDocType,
+				$phpDocParameterTypes,
+				$phpDocThrowType,
+				$deprecatedDescription,
+				$isDeprecated,
+				$isPure,
+				$phpDocComment,
+				$resolvedPhpDoc,
+			);
+			$hookReflection = $hookScope->getFunction();
+			if (!$hookReflection instanceof PhpMethodFromParserNodeReflection) {
+				throw new ShouldNotHappenException();
+			}
+
+			if (!$classReflection->hasNativeProperty($propertyName)) {
+				throw new ShouldNotHappenException();
+			}
+
+			$propertyReflection = $classReflection->getNativeProperty($propertyName);
+
+			$dependencies[] = Dependencies::create($hookScope->getFile(), DependencyTypes::ofDeclaration($hookReflection, false));
+			$nodeScopeResolver->callNodeCallback($nodeCallback, new InPropertyHookNode(
+				$classReflection,
+				$hookReflection,
+				$propertyReflection,
+				$hook,
+			), $hookScope, $storage);
+
+			$stmts = $hook->getStmts();
+			if ($stmts === null) {
+				// abstract hook - the sibling hook of the same property may still
+				// have a body, so keep going
+				continue;
+			}
+
+			if ($hook->body instanceof Expr) {
+				// enrich attributes of nodes in short hook body statements
+				$traverser = new NodeTraverser(
+					new LineAttributesVisitor($hook->body->getStartLine(), $hook->body->getEndLine()),
+				);
+				$traverser->traverse($stmts);
+			}
+
+			$gatheredReturnStatements = [];
+			$gatheredReturnStatementsAfterFinally = [];
+			$executionEnds = [];
+			$hookImpurePoints = [];
+			$nodeScopeResolver->pushNodeGatherer(static function (Node $node, Scope $scope) use ($hookScope, &$gatheredReturnStatements, &$gatheredReturnStatementsAfterFinally, &$executionEnds, &$hookImpurePoints): void {
+				if ($scope->getFunction() !== $hookScope->getFunction()) {
+					return;
+				}
+				if ($scope->isInAnonymousFunction()) {
+					return;
+				}
+				if ($node instanceof PropertyAssignNode) {
+					$hookImpurePoints[] = new ImpurePoint(
+						$scope,
+						$node,
+						'propertyAssign',
+						'property assignment',
+						true,
+					);
+					return;
+				}
+				if ($node instanceof ExecutionEndNode) {
+					$executionEnds[] = $node;
+					return;
+				}
+				if ($node instanceof ReturnAfterFinallyNode) {
+					$gatheredReturnStatementsAfterFinally[] = new ReturnStatement($scope, $node->getReturnNode());
+					return;
+				}
+				if (!$node instanceof Return_) {
+					return;
+				}
+
+				$gatheredReturnStatements[] = new ReturnStatement($scope, $node);
+			});
+			try {
+				$internalStatementResult = $nodeScopeResolver->processStmtNodesInternal(new PropertyHookStatementNode($hook), $stmts, $hookScope, $storage, $nodeCallback, StatementContext::createTopLevel());
+				$dependencies[] = $internalStatementResult->getDependencies();
+				$statementResult = $internalStatementResult->toPublic();
+			} finally {
+				$nodeScopeResolver->popNodeGatherer();
+			}
+
+			$nodeScopeResolver->callNodeCallback($nodeCallback, new PropertyHookReturnStatementsNode(
+				$hook,
+				$gatheredReturnStatements,
+				$gatheredReturnStatementsAfterFinally,
+				$statementResult,
+				$executionEnds,
+				array_merge($statementResult->getImpurePoints(), $hookImpurePoints),
+				$classReflection,
+				$hookReflection,
+				$propertyReflection,
+			), $hookScope, $storage);
+			$nodeScopeResolver->callNodeCallback($nodeCallback, VariableLivenessResolver::resolve($hook, $internalStatementResult->getVariableFlow()), $hookScope, $storage);
+		}
+
+		return Dependencies::merge(...$dependencies);
+	}
+
+}
