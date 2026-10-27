@@ -1,0 +1,159 @@
+<?php 
+
+namespace PHPStan\Rules\Functions;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\Expr\FuncCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Php\PhpVersions;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use PHPStan\Type\Php\PrintfFormatParser;
+use ValueError;
+use function array_key_exists;
+use function count;
+use function in_array;
+use function sprintf;
+use function sscanf;
+
+/**
+ * @implements Rule<Node\Expr\FuncCall>
+ */
+#[RegisteredRule(level: 0)]
+final class PrintfParametersRule implements Rule
+{
+
+	private const FORMAT_ARGUMENT_POSITIONS = [
+		'printf' => 0,
+		'sprintf' => 0,
+		'sscanf' => 1,
+		'fscanf' => 1,
+	];
+	private const MINIMUM_NUMBER_OF_ARGUMENTS = [
+		'printf' => 1,
+		'sprintf' => 1,
+		'sscanf' => 3,
+		'fscanf' => 3,
+	];
+
+	public function __construct(
+		private PrintfFormatParser $printfFormatParser,
+		private ReflectionProvider $reflectionProvider,
+	)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return FuncCall::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!($node->name instanceof Node\Name)) {
+			return [];
+		}
+
+		if (!$this->reflectionProvider->hasFunction($node->name, $scope)) {
+			return [];
+		}
+
+		$functionReflection = $this->reflectionProvider->getFunction($node->name, $scope);
+		$name = $functionReflection->getName();
+		if (!array_key_exists($name, self::FORMAT_ARGUMENT_POSITIONS)) {
+			return [];
+		}
+
+		$formatArgumentPosition = self::FORMAT_ARGUMENT_POSITIONS[$name];
+
+		$args = $node->getArgs();
+		foreach ($args as $arg) {
+			if ($arg->unpack) {
+				return [];
+			}
+		}
+		$argsCount = count($args);
+		if ($argsCount < self::MINIMUM_NUMBER_OF_ARGUMENTS[$name]) {
+			return []; // caught by CallToFunctionParametersRule
+		}
+
+		$formatArgType = $scope->getType($args[$formatArgumentPosition]->value);
+		$maxPlaceHoldersCount = null;
+		foreach ($formatArgType->getConstantStrings() as $formatString) {
+			$format = $formatString->getValue();
+
+			if (in_array($name, ['sprintf', 'printf'], true)) {
+				$tempPlaceHoldersCount = $this->getPrintfPlaceholdersCount($format, $scope->getPhpVersion());
+			} else {
+				$tempPlaceHoldersCount = $this->getScanfPlaceholdersCount($format);
+			}
+
+			if ($tempPlaceHoldersCount === null) {
+				return [
+					RuleErrorBuilder::message(sprintf(
+						'Call to %s contains an invalid placeholder.',
+						$name,
+					))->identifier(sprintf('argument.%s', $name))->build(),
+				];
+			}
+
+			if ($maxPlaceHoldersCount === null) {
+				$maxPlaceHoldersCount = $tempPlaceHoldersCount;
+			} elseif ($tempPlaceHoldersCount > $maxPlaceHoldersCount) {
+				$maxPlaceHoldersCount = $tempPlaceHoldersCount;
+			}
+		}
+
+		if ($maxPlaceHoldersCount === null) {
+			return [];
+		}
+
+		$argsCount -= $formatArgumentPosition;
+
+		if ($argsCount !== $maxPlaceHoldersCount + 1) {
+			return [
+				RuleErrorBuilder::message(sprintf(
+					sprintf(
+						'%s, %s.',
+						$maxPlaceHoldersCount === 1 ? 'Call to %s contains %d placeholder' : 'Call to %s contains %d placeholders',
+						$argsCount - 1 === 1 ? '%d value given' : '%d values given',
+					),
+					$name,
+					$maxPlaceHoldersCount,
+					$argsCount - 1,
+				))->identifier(sprintf('argument.%s', $name))->build(),
+			];
+		}
+
+		return [];
+	}
+
+	private function getPrintfPlaceholdersCount(string $format, PhpVersions $phpVersions): ?int
+	{
+		$uses = $this->printfFormatParser->parse($format, $phpVersions);
+		if ($uses === null) {
+			return null;
+		}
+
+		return $this->printfFormatParser->getRequiredArgumentsCount($uses);
+	}
+
+	private function getScanfPlaceholdersCount(string $format): ?int
+	{
+		try {
+			$result = @sscanf('', '%*n' . $format);
+		} catch (ValueError) {
+			return null;
+		}
+
+		if ($result === null) {
+			return null;
+		}
+
+		return count($result);
+	}
+
+}
