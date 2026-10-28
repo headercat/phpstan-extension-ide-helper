@@ -1,0 +1,154 @@
+<?php 
+
+namespace PHPStan\Analyser\ExprHandler\Helper;
+return;
+
+use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Identifier;
+use PHPStan\Analyser\ConditionalTypeResolver;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\InternalThrowPoint;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\DependencyInjection\AutowiredExtensions;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\DependencyInjection\ExtensionsCollection;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Reflection\ParametersAcceptor;
+use PHPStan\Reflection\ParametersAcceptorSelector;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\DynamicMethodThrowTypeExtension;
+use PHPStan\Type\DynamicStaticMethodThrowTypeExtension;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\Type;
+use ReflectionFunction;
+use ReflectionMethod;
+use Throwable;
+use function in_array;
+
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../../turbo-ext/src/MethodThrowPointHelper.cpp')]
+final class MethodThrowPointHelper
+{
+
+	/**
+	 * @param ExtensionsCollection<DynamicMethodThrowTypeExtension> $dynamicMethodThrowTypeExtensions
+	 * @param ExtensionsCollection<DynamicStaticMethodThrowTypeExtension> $dynamicStaticMethodThrowTypeExtensions
+	 */
+	public function __construct(
+		#[AutowiredExtensions(of: DynamicMethodThrowTypeExtension::class)]
+		private ExtensionsCollection $dynamicMethodThrowTypeExtensions,
+		#[AutowiredExtensions(of: DynamicStaticMethodThrowTypeExtension::class)]
+		private ExtensionsCollection $dynamicStaticMethodThrowTypeExtensions,
+		#[AutowiredParameter(ref: '%exceptions.implicitThrows%')]
+		private bool $implicitThrows,
+	)
+	{
+	}
+
+	/**
+	 * @param Type $methodCallReturnType the resolved return type of $normalizedMethodCall;
+	 *     passed in by the caller so this helper never asks Scope::getType() itself
+	 *     (the old-world call handlers resolve it directly, the new-world toString
+	 *     path prices the synthetic call on demand)
+	 */
+	public function getThrowPoint(
+		MethodReflection $methodReflection,
+		ParametersAcceptor $parametersAcceptor,
+		MethodCall|StaticCall $normalizedMethodCall,
+		MutatingScope $scope,
+		ExpressionContext $context,
+		Type $methodCallReturnType,
+	): ?InternalThrowPoint
+	{
+		if ($normalizedMethodCall instanceof MethodCall) {
+			foreach ($this->dynamicMethodThrowTypeExtensions->getAll() as $extension) {
+				if (!$extension->isMethodSupported($methodReflection)) {
+					continue;
+				}
+
+				$throwType = $extension->getThrowTypeFromMethodCall($methodReflection, $normalizedMethodCall, $scope);
+				if ($throwType === null || $throwType->isVoid()->yes()) {
+					return null;
+				}
+
+				return InternalThrowPoint::createExplicit($scope, $throwType, $normalizedMethodCall, false);
+			}
+		} else {
+			foreach ($this->dynamicStaticMethodThrowTypeExtensions->getAll() as $extension) {
+				if (!$extension->isStaticMethodSupported($methodReflection)) {
+					continue;
+				}
+
+				$throwType = $extension->getThrowTypeFromStaticMethodCall($methodReflection, $normalizedMethodCall, $scope);
+				if ($throwType === null || $throwType->isVoid()->yes()) {
+					return null;
+				}
+
+				return InternalThrowPoint::createExplicit($scope, $throwType, $normalizedMethodCall, false);
+			}
+		}
+
+		if (
+			$normalizedMethodCall instanceof MethodCall
+			&& in_array($methodReflection->getName(), ['invoke', 'invokeArgs'], true)
+			&& in_array($methodReflection->getDeclaringClass()->getName(), [ReflectionMethod::class, ReflectionFunction::class], true)
+		) {
+			return InternalThrowPoint::createImplicit($scope, $normalizedMethodCall);
+		}
+
+		$throwType = $methodReflection->getThrowType();
+		if ($throwType !== null) {
+			$throwType = ConditionalTypeResolver::resolveForCall($throwType, $parametersAcceptor, $normalizedMethodCall->getArgs(), $scope);
+		}
+		if ($throwType === null) {
+			if ($methodCallReturnType instanceof NeverType && $methodCallReturnType->isExplicit()) {
+				$throwType = new ObjectType(Throwable::class);
+			}
+		}
+
+		if ($throwType !== null) {
+			if (!$throwType->isVoid()->yes()) {
+				return InternalThrowPoint::createExplicit($scope, $throwType, $normalizedMethodCall, true);
+			}
+		} elseif ($this->implicitThrows) {
+			if (!$context->isInThrow() || !(new ObjectType(Throwable::class))->isSuperTypeOf($methodCallReturnType)->yes()) {
+				return InternalThrowPoint::createImplicit($scope, $normalizedMethodCall);
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * The throw points of invoking a method on an already-priced receiver
+	 * type - what walking a synthetic MethodCall used to produce, without the
+	 * walk. The method call node is only the throw-point anchor and the
+	 * payload dynamic throw-type extensions receive; nothing processes it.
+	 *
+	 * @return list<InternalThrowPoint>
+	 */
+	public function getThrowPointsForCallOnType(MutatingScope $scope, ExpressionContext $context, Type $calledOnType, MethodCall $methodCall): array
+	{
+		if (!$methodCall->name instanceof Identifier) {
+			throw new ShouldNotHappenException();
+		}
+
+		$methodReflection = $scope->getMethodReflection($calledOnType, $methodCall->name->toString());
+		if ($methodReflection === null) {
+			return [InternalThrowPoint::createImplicit($scope, $methodCall)];
+		}
+
+		$parametersAcceptor = ParametersAcceptorSelector::combineVariantsForNormalization($methodCall->getArgs(), $methodReflection->getVariants(), $methodReflection->getNamedArgumentsVariants());
+		$throwPoint = $this->getThrowPoint($methodReflection, $parametersAcceptor, $methodCall, $scope, $context, $parametersAcceptor->getReturnType());
+		if ($throwPoint === null) {
+			return [];
+		}
+
+		return [$throwPoint];
+	}
+
+}

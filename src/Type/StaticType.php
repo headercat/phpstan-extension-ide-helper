@@ -1,0 +1,952 @@
+<?php 
+
+namespace PHPStan\Type;
+return;
+
+use PhpParser\Node\Name;
+use PHPStan\Php\PhpVersion;
+use PHPStan\PhpDocParser\Ast\Type\IdentifierTypeNode;
+use PHPStan\PhpDocParser\Ast\Type\TypeNode;
+use PHPStan\Reflection\ClassConstantReflection;
+use PHPStan\Reflection\ClassMemberAccessAnswerer;
+use PHPStan\Reflection\ClassReflection;
+use PHPStan\Reflection\ExtendedMethodReflection;
+use PHPStan\Reflection\ExtendedPropertyReflection;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Reflection\Type\CallbackUnresolvedMethodPrototypeReflection;
+use PHPStan\Reflection\Type\CallbackUnresolvedPropertyPrototypeReflection;
+use PHPStan\Reflection\Type\UnresolvedMethodPrototypeReflection;
+use PHPStan\Reflection\Type\UnresolvedPropertyPrototypeReflection;
+use PHPStan\TrinaryLogic;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\Accessory\AccessoryLiteralStringType;
+use PHPStan\Type\Enum\EnumCaseObjectType;
+use PHPStan\Type\Generic\GenericClassStringType;
+use PHPStan\Type\Generic\GenericObjectType;
+use PHPStan\Type\Generic\TemplateTypeHelper;
+use PHPStan\Type\Traits\NonGeneralizableTypeTrait;
+use PHPStan\Type\Traits\NonGenericTypeTrait;
+use PHPStan\Type\Traits\UndecidedComparisonTypeTrait;
+use function get_class;
+use function sprintf;
+
+/** @api */
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/StaticType.cpp')]
+class StaticType implements TypeWithClassName, SubtractableType
+{
+
+	use NonGenericTypeTrait;
+	use UndecidedComparisonTypeTrait;
+	use NonGeneralizableTypeTrait;
+
+	private ?Type $subtractedType;
+
+	private ?ObjectType $staticObjectType = null;
+
+	private string $baseClass;
+
+	/** @var array<string, ExtendedMethodReflection> */
+	private array $methodCache = [];
+
+	/**
+	 * @api
+	 */
+	public function __construct(
+		private ClassReflection $classReflection,
+		?Type $subtractedType = null,
+	)
+	{
+		if ($subtractedType instanceof NeverType) {
+			$subtractedType = null;
+		}
+
+		$this->subtractedType = $subtractedType;
+		$this->baseClass = $classReflection->getName();
+	}
+
+	public function getClassName(): string
+	{
+		return $this->baseClass;
+	}
+
+	public function getClassReflection(): ClassReflection
+	{
+		return $this->classReflection;
+	}
+
+	public function getAncestorWithClassName(string $className): ?TypeWithClassName
+	{
+		$ancestor = $this->getStaticObjectType()->getAncestorWithClassName($className);
+		if ($ancestor === null) {
+			return null;
+		}
+
+		$classReflection = $ancestor->getClassReflection();
+		if ($classReflection !== null) {
+			return $this->changeBaseClass($classReflection);
+		}
+
+		return null;
+	}
+
+	public function getStaticObjectType(): ObjectType
+	{
+		if ($this->staticObjectType === null) {
+			if ($this->classReflection->isGeneric()) {
+				$typeMap = $this->classReflection->getActiveTemplateTypeMap()->map(static fn (string $name, Type $type): Type => TemplateTypeHelper::toArgument($type));
+				$varianceMap = $this->classReflection->getCallSiteVarianceMap();
+				return $this->staticObjectType = new GenericObjectType(
+					$this->classReflection->getName(),
+					$this->classReflection->typeMapToList($typeMap),
+					$this->subtractedType,
+					variances: $this->classReflection->varianceMapToList($varianceMap),
+				);
+			}
+
+			return $this->staticObjectType = new ObjectType($this->classReflection->getName(), $this->subtractedType, $this->classReflection);
+		}
+
+		return $this->staticObjectType;
+	}
+
+	public function getReferencedClasses(): array
+	{
+		return $this->getStaticObjectType()->getReferencedClasses();
+	}
+
+	public function getObjectClassNames(): array
+	{
+		return $this->getStaticObjectType()->getObjectClassNames();
+	}
+
+	public function getObjectClassReflections(): array
+	{
+		return $this->getStaticObjectType()->getObjectClassReflections();
+	}
+
+	public function getArrays(): array
+	{
+		return $this->getStaticObjectType()->getArrays();
+	}
+
+	public function getConstantArrays(): array
+	{
+		return $this->getStaticObjectType()->getConstantArrays();
+	}
+
+	public function getConstantStrings(): array
+	{
+		return $this->getStaticObjectType()->getConstantStrings();
+	}
+
+	public function accepts(Type $type, bool $strictTypes): AcceptsResult
+	{
+		if ($type instanceof CompoundType) {
+			return $type->isAcceptedBy($this, $strictTypes);
+		}
+
+		if (!$type instanceof static) {
+			return AcceptsResult::createNo();
+		}
+
+		return $this->getStaticObjectType()->accepts($type->getStaticObjectType(), $strictTypes);
+	}
+
+	public function isSuperTypeOf(Type $type): IsSuperTypeOfResult
+	{
+		if ($type instanceof self) {
+			return $this->getStaticObjectType()->isSuperTypeOf($type);
+		}
+
+		if ($type instanceof ObjectWithoutClassType) {
+			return IsSuperTypeOfResult::createMaybe();
+		}
+
+		if ($type instanceof ObjectType) {
+			$result = $this->getStaticObjectType()->isSuperTypeOf($type);
+			if ($result->yes()) {
+				$classReflection = $type->getClassReflection();
+				if ($classReflection !== null && $classReflection->isFinal()) {
+					return $result;
+				}
+			}
+
+			return $result->and(IsSuperTypeOfResult::createMaybe());
+		}
+
+		if ($type instanceof CompoundType) {
+			return $type->isSubTypeOf($this);
+		}
+
+		return IsSuperTypeOfResult::createNo();
+	}
+
+	public function equals(Type $type): bool
+	{
+		if (get_class($type) !== static::class) {
+			return false;
+		}
+
+		return $this->getStaticObjectType()->equals($type->getStaticObjectType());
+	}
+
+	public function describe(VerbosityLevel $level): string
+	{
+		return sprintf('static(%s)', $this->getStaticObjectType()->describe($level));
+	}
+
+	public function getTemplateType(string $ancestorClassName, string $templateTypeName): Type
+	{
+		return $this->getStaticObjectType()->getTemplateType($ancestorClassName, $templateTypeName);
+	}
+
+	public function isObject(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isObject();
+	}
+
+	public function getClassStringType(): Type
+	{
+		return new GenericClassStringType($this);
+	}
+
+	public function isEnum(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isEnum();
+	}
+
+	public function canAccessProperties(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->canAccessProperties();
+	}
+
+	public function hasProperty(string $propertyName): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->hasProperty($propertyName);
+	}
+
+	public function getProperty(string $propertyName, ClassMemberAccessAnswerer $scope): ExtendedPropertyReflection
+	{
+		return $this->getUnresolvedPropertyPrototype($propertyName, $scope)->getTransformedProperty();
+	}
+
+	public function getUnresolvedPropertyPrototype(string $propertyName, ClassMemberAccessAnswerer $scope): UnresolvedPropertyPrototypeReflection
+	{
+		$staticObject = $this->getStaticObjectType();
+		$nakedProperty = $staticObject->getUnresolvedPropertyPrototype($propertyName, $scope)->getNakedProperty();
+
+		$ancestor = $this->getAncestorWithClassName($nakedProperty->getDeclaringClass()->getName());
+		$classReflection = null;
+		if ($ancestor !== null) {
+			$classReflection = $ancestor->getClassReflection();
+		}
+		if ($classReflection === null) {
+			$classReflection = $nakedProperty->getDeclaringClass();
+		}
+
+		return new CallbackUnresolvedPropertyPrototypeReflection(
+			$nakedProperty,
+			$classReflection,
+			false,
+			fn (Type $type): Type => $this->transformStaticType($type, $scope),
+		);
+	}
+
+	public function hasInstanceProperty(string $propertyName): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->hasInstanceProperty($propertyName);
+	}
+
+	public function getInstanceProperty(string $propertyName, ClassMemberAccessAnswerer $scope): ExtendedPropertyReflection
+	{
+		return $this->getUnresolvedInstancePropertyPrototype($propertyName, $scope)->getTransformedProperty();
+	}
+
+	public function getUnresolvedInstancePropertyPrototype(string $propertyName, ClassMemberAccessAnswerer $scope): UnresolvedPropertyPrototypeReflection
+	{
+		$staticObject = $this->getStaticObjectType();
+		$nakedProperty = $staticObject->getUnresolvedInstancePropertyPrototype($propertyName, $scope)->getNakedProperty();
+
+		$ancestor = $this->getAncestorWithClassName($nakedProperty->getDeclaringClass()->getName());
+		$classReflection = null;
+		if ($ancestor !== null) {
+			$classReflection = $ancestor->getClassReflection();
+		}
+		if ($classReflection === null) {
+			$classReflection = $nakedProperty->getDeclaringClass();
+		}
+
+		return new CallbackUnresolvedPropertyPrototypeReflection(
+			$nakedProperty,
+			$classReflection,
+			false,
+			fn (Type $type): Type => $this->transformStaticType($type, $scope),
+		);
+	}
+
+	public function hasStaticProperty(string $propertyName): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->hasStaticProperty($propertyName);
+	}
+
+	public function getStaticProperty(string $propertyName, ClassMemberAccessAnswerer $scope): ExtendedPropertyReflection
+	{
+		return $this->getUnresolvedStaticPropertyPrototype($propertyName, $scope)->getTransformedProperty();
+	}
+
+	public function getUnresolvedStaticPropertyPrototype(string $propertyName, ClassMemberAccessAnswerer $scope): UnresolvedPropertyPrototypeReflection
+	{
+		$staticObject = $this->getStaticObjectType();
+		$nakedProperty = $staticObject->getUnresolvedStaticPropertyPrototype($propertyName, $scope)->getNakedProperty();
+
+		$ancestor = $this->getAncestorWithClassName($nakedProperty->getDeclaringClass()->getName());
+		$classReflection = null;
+		if ($ancestor !== null) {
+			$classReflection = $ancestor->getClassReflection();
+		}
+		if ($classReflection === null) {
+			$classReflection = $nakedProperty->getDeclaringClass();
+		}
+
+		return new CallbackUnresolvedPropertyPrototypeReflection(
+			$nakedProperty,
+			$classReflection,
+			false,
+			fn (Type $type): Type => $this->transformStaticType($type, $scope),
+		);
+	}
+
+	public function canCallMethods(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->canCallMethods();
+	}
+
+	public function hasMethod(string $methodName): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->hasMethod($methodName);
+	}
+
+	public function getMethod(string $methodName, ClassMemberAccessAnswerer $scope): ExtendedMethodReflection
+	{
+		$key = $methodName;
+		if ($scope->isInClass()) {
+			$key = sprintf('%s-%s', $key, $scope->getClassReflection()->getCacheKey());
+		}
+		return $this->methodCache[$key] ??= $this->getUnresolvedMethodPrototype($methodName, $scope)->getTransformedMethod();
+	}
+
+	public function getUnresolvedMethodPrototype(string $methodName, ClassMemberAccessAnswerer $scope): UnresolvedMethodPrototypeReflection
+	{
+		$staticObject = $this->getStaticObjectType();
+		$nakedMethod = $staticObject->getUnresolvedMethodPrototype($methodName, $scope)->getNakedMethod();
+
+		$ancestor = $this->getAncestorWithClassName($nakedMethod->getDeclaringClass()->getName());
+		$classReflection = null;
+		if ($ancestor !== null) {
+			$classReflection = $ancestor->getClassReflection();
+		}
+		if ($classReflection === null) {
+			$classReflection = $nakedMethod->getDeclaringClass();
+		}
+
+		return new CallbackUnresolvedMethodPrototypeReflection(
+			$nakedMethod,
+			$classReflection,
+			false,
+			fn (Type $type): Type => $this->transformStaticType($type, $scope),
+		);
+	}
+
+	private function transformStaticType(Type $type, ClassMemberAccessAnswerer $scope): Type
+	{
+		return TypeTraverser::map($type, function (Type $type, callable $traverse) use ($scope): Type {
+			if ($type instanceof StaticType) {
+				$classReflection = $this->classReflection;
+				$isFinal = false;
+				if ($scope->isInClass()) {
+					$classReflection = $scope->getClassReflection();
+					$isFinal = $classReflection->isFinal();
+				}
+				$type = $type->changeBaseClass($classReflection);
+
+				// When calling a method on a `static` type (not `$this`),
+				// `$this` return type should be downgraded to `static`
+				// because we can't guarantee the exact instance.
+				if ($type instanceof ThisType && !$this instanceof ThisType) {
+					$type = new self($type->getClassReflection(), $type->getSubtractedType());
+				}
+
+				if ($this->getSubtractedType() !== null) {
+					$type = $type->subtract($this->getSubtractedType());
+					if (!$type instanceof StaticType) {
+						return $traverse($type);
+					}
+				}
+
+				if (!$isFinal || $type instanceof ThisType) {
+					return RecursionGuard::run($type, static fn () => $traverse($type));
+				}
+
+				return $traverse($type->getStaticObjectType());
+			}
+
+			return $traverse($type);
+		});
+	}
+
+	public function canAccessConstants(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->canAccessConstants();
+	}
+
+	public function hasConstant(string $constantName): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->hasConstant($constantName);
+	}
+
+	public function getConstant(string $constantName): ClassConstantReflection
+	{
+		return $this->getStaticObjectType()->getConstant($constantName);
+	}
+
+	public function changeBaseClass(ClassReflection $classReflection): self
+	{
+		return new self($classReflection, $this->subtractedType);
+	}
+
+	public function isIterable(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isIterable();
+	}
+
+	public function isIterableAtLeastOnce(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isIterableAtLeastOnce();
+	}
+
+	public function getArraySize(): Type
+	{
+		return $this->getStaticObjectType()->getArraySize();
+	}
+
+	public function getIterableKeyType(): Type
+	{
+		return $this->getStaticObjectType()->getIterableKeyType();
+	}
+
+	public function getFirstIterableKeyType(): Type
+	{
+		return $this->getStaticObjectType()->getIterableKeyType();
+	}
+
+	public function getLastIterableKeyType(): Type
+	{
+		return $this->getStaticObjectType()->getIterableKeyType();
+	}
+
+	public function getIterableValueType(): Type
+	{
+		return $this->getStaticObjectType()->getIterableValueType();
+	}
+
+	public function getFirstIterableValueType(): Type
+	{
+		return $this->getStaticObjectType()->getIterableValueType();
+	}
+
+	public function getLastIterableValueType(): Type
+	{
+		return $this->getStaticObjectType()->getIterableValueType();
+	}
+
+	public function isOffsetAccessible(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isOffsetAccessible();
+	}
+
+	public function isOffsetAccessLegal(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isOffsetAccessLegal();
+	}
+
+	public function hasOffsetValueType(Type $offsetType): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->hasOffsetValueType($offsetType);
+	}
+
+	public function getOffsetValueType(Type $offsetType): Type
+	{
+		return $this->getStaticObjectType()->getOffsetValueType($offsetType);
+	}
+
+	public function setOffsetValueType(?Type $offsetType, Type $valueType, bool $unionValues = true): Type
+	{
+		return $this->getStaticObjectType()->setOffsetValueType($offsetType, $valueType, $unionValues);
+	}
+
+	public function setExistingOffsetValueType(Type $offsetType, Type $valueType): Type
+	{
+		return $this->getStaticObjectType()->setExistingOffsetValueType($offsetType, $valueType);
+	}
+
+	public function unsetOffset(Type $offsetType): Type
+	{
+		return $this->getStaticObjectType()->unsetOffset($offsetType);
+	}
+
+	public function getKeysArrayFiltered(Type $filterValueType, TrinaryLogic $strict): Type
+	{
+		return $this->getStaticObjectType()->getKeysArrayFiltered($filterValueType, $strict);
+	}
+
+	public function getKeysArray(): Type
+	{
+		return $this->getStaticObjectType()->getKeysArray();
+	}
+
+	public function getValuesArray(): Type
+	{
+		return $this->getStaticObjectType()->getValuesArray();
+	}
+
+	public function chunkArray(Type $lengthType, TrinaryLogic $preserveKeys): Type
+	{
+		return $this->getStaticObjectType()->chunkArray($lengthType, $preserveKeys);
+	}
+
+	public function fillKeysArray(Type $valueType): Type
+	{
+		return $this->getStaticObjectType()->fillKeysArray($valueType);
+	}
+
+	public function flipArray(): Type
+	{
+		return $this->getStaticObjectType()->flipArray();
+	}
+
+	public function intersectKeyArray(Type $otherArraysType): Type
+	{
+		return $this->getStaticObjectType()->intersectKeyArray($otherArraysType);
+	}
+
+	public function popArray(): Type
+	{
+		return $this->getStaticObjectType()->popArray();
+	}
+
+	public function reverseArray(TrinaryLogic $preserveKeys): Type
+	{
+		return $this->getStaticObjectType()->reverseArray($preserveKeys);
+	}
+
+	public function searchArray(Type $needleType, ?TrinaryLogic $strict = null): Type
+	{
+		return $this->getStaticObjectType()->searchArray($needleType, $strict);
+	}
+
+	public function shiftArray(): Type
+	{
+		return $this->getStaticObjectType()->shiftArray();
+	}
+
+	public function shuffleArray(): Type
+	{
+		return $this->getStaticObjectType()->shuffleArray();
+	}
+
+	public function sliceArray(Type $offsetType, Type $lengthType, TrinaryLogic $preserveKeys): Type
+	{
+		return $this->getStaticObjectType()->sliceArray($offsetType, $lengthType, $preserveKeys);
+	}
+
+	public function spliceArray(Type $offsetType, Type $lengthType, Type $replacementType): Type
+	{
+		return $this->getStaticObjectType()->spliceArray($offsetType, $lengthType, $replacementType);
+	}
+
+	public function truncateListToSize(Type $sizeType): Type
+	{
+		return $this->getStaticObjectType()->truncateListToSize($sizeType);
+	}
+
+	public function makeListMaybe(): Type
+	{
+		return $this->getStaticObjectType()->makeListMaybe();
+	}
+
+	public function mapValueType(callable $cb): Type
+	{
+		return $this->getStaticObjectType()->mapValueType($cb);
+	}
+
+	public function mapKeyType(callable $cb): Type
+	{
+		return $this->getStaticObjectType()->mapKeyType($cb);
+	}
+
+	public function makeAllArrayKeysOptional(): Type
+	{
+		return $this->getStaticObjectType()->makeAllArrayKeysOptional();
+	}
+
+	public function changeKeyCaseArray(?int $case): Type
+	{
+		return $this->getStaticObjectType()->changeKeyCaseArray($case);
+	}
+
+	public function filterArrayRemovingFalsey(): Type
+	{
+		return $this->getStaticObjectType()->filterArrayRemovingFalsey();
+	}
+
+	public function isCallable(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isCallable();
+	}
+
+	public function getEnumCases(): array
+	{
+		return $this->getStaticObjectType()->getEnumCases();
+	}
+
+	public function getEnumCaseObject(): ?EnumCaseObjectType
+	{
+		return $this->getStaticObjectType()->getEnumCaseObject();
+	}
+
+	public function isArray(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isArray();
+	}
+
+	public function isConstantArray(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isConstantArray();
+	}
+
+	public function isOversizedArray(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isOversizedArray();
+	}
+
+	public function isList(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isList();
+	}
+
+	public function isNull(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isNull();
+	}
+
+	public function isConstantValue(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isConstantValue();
+	}
+
+	public function isConstantScalarValue(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isConstantScalarValue();
+	}
+
+	public function getConstantScalarTypes(): array
+	{
+		return $this->getStaticObjectType()->getConstantScalarTypes();
+	}
+
+	public function getConstantScalarValues(): array
+	{
+		return $this->getStaticObjectType()->getConstantScalarValues();
+	}
+
+	public function isTrue(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isTrue();
+	}
+
+	public function isFalse(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isFalse();
+	}
+
+	public function isBoolean(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isBoolean();
+	}
+
+	public function isFloat(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isFloat();
+	}
+
+	public function isInteger(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isInteger();
+	}
+
+	public function isString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isString();
+	}
+
+	public function isNumericString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isNumericString();
+	}
+
+	public function isDecimalIntegerString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isDecimalIntegerString();
+	}
+
+	public function isNonEmptyString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isNonEmptyString();
+	}
+
+	public function isNonFalsyString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isNonFalsyString();
+	}
+
+	public function isLiteralString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isLiteralString();
+	}
+
+	public function isLowercaseString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isLowercaseString();
+	}
+
+	public function isUppercaseString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isUppercaseString();
+	}
+
+	public function isClassString(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isClassString();
+	}
+
+	public function getClassStringObjectType(): Type
+	{
+		return $this->getStaticObjectType()->getClassStringObjectType();
+	}
+
+	public function getObjectTypeOrClassStringObjectType(): Type
+	{
+		return $this;
+	}
+
+	public function isVoid(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isVoid();
+	}
+
+	public function isScalar(): TrinaryLogic
+	{
+		return $this->getStaticObjectType()->isScalar();
+	}
+
+	public function looseCompare(Type $type, PhpVersion $phpVersion): BooleanType
+	{
+		return new BooleanType();
+	}
+
+	public function getCallableParametersAcceptors(ClassMemberAccessAnswerer $scope): array
+	{
+		return $this->getStaticObjectType()->getCallableParametersAcceptors($scope);
+	}
+
+	public function isCloneable(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function toNumber(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toBitwiseNotType(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toGetClassResultType(): Type
+	{
+		// Preserve static binding (`class-string<static>` /
+		// `class-string<$this>`) by going through `getClassStringType()`
+		// directly instead of delegating to the underlying object type,
+		// which would resolve `static` away.
+		return $this->getClassStringType();
+	}
+
+	public function toClassConstantType(ReflectionProvider $reflectionProvider): Type
+	{
+		// Like `toGetClassResultType()`, project through this `StaticType`'s
+		// own `getClassStringType()` so that `static::class` reads as
+		// `class-string<static>` rather than the underlying class.
+		return new IntersectionType([$this->getClassStringType(), new AccessoryLiteralStringType()]);
+	}
+
+	public function toObjectTypeForInstanceofCheck(): ClassNameToObjectTypeResult
+	{
+		return new ClassNameToObjectTypeResult($this, true);
+	}
+
+	public function toObjectTypeForIsACheck(Type $objectOrClassType, bool $allowString, bool $allowSameClass): ClassNameToObjectTypeResult
+	{
+		if ($allowString) {
+			return new ClassNameToObjectTypeResult(
+				new UnionType([new ObjectWithoutClassType(), new ClassStringType()]),
+				false,
+			);
+		}
+
+		return new ClassNameToObjectTypeResult(new ObjectWithoutClassType(), false);
+	}
+
+	public function toAbsoluteNumber(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toString(): Type
+	{
+		return $this->getStaticObjectType()->toString();
+	}
+
+	public function toInteger(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toFloat(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toArray(): Type
+	{
+		return $this->getStaticObjectType()->toArray();
+	}
+
+	public function toArrayKey(): Type
+	{
+		return $this->getStaticObjectType()->toArrayKey();
+	}
+
+	public function toCoercedArgumentType(bool $strictTypes): Type
+	{
+		return $this->getStaticObjectType()->toCoercedArgumentType($strictTypes);
+	}
+
+	public function toBoolean(): BooleanType
+	{
+		return $this->getStaticObjectType()->toBoolean();
+	}
+
+	public function traverse(callable $cb): Type
+	{
+		$subtractedType = $this->subtractedType !== null ? $cb($this->subtractedType) : null;
+
+		if ($subtractedType !== $this->subtractedType) {
+			return new self(
+				$this->classReflection,
+				$subtractedType,
+			);
+		}
+
+		return $this;
+	}
+
+	public function traverseSimultaneously(Type $right, callable $cb): Type
+	{
+		if ($this->subtractedType === null) {
+			return $this;
+		}
+
+		return new self($this->classReflection);
+	}
+
+	public function subtract(Type $type): Type
+	{
+		if ($this->subtractedType !== null) {
+			$type = TypeCombinator::union($this->subtractedType, $type);
+		}
+
+		return $this->changeSubtractedType($type);
+	}
+
+	public function getTypeWithoutSubtractedType(): Type
+	{
+		return $this->changeSubtractedType(null);
+	}
+
+	public function changeSubtractedType(?Type $subtractedType): Type
+	{
+		if ($subtractedType !== null) {
+			$classReflection = $this->getClassReflection();
+			if ($classReflection->getAllowedSubTypes() !== null) {
+				$objectType = $this->getStaticObjectType()->changeSubtractedType($subtractedType);
+				if ($objectType instanceof NeverType) {
+					return $objectType;
+				}
+
+				if ($objectType instanceof ObjectType && $objectType->getSubtractedType() !== null) {
+					return new self($classReflection, $objectType->getSubtractedType());
+				}
+
+				return TypeCombinator::intersect($this, $objectType);
+			}
+		}
+
+		return new self($this->classReflection, $subtractedType);
+	}
+
+	public function getSubtractedType(): ?Type
+	{
+		return $this->subtractedType;
+	}
+
+	public function tryRemove(Type $typeToRemove): ?Type
+	{
+		if ($this->getStaticObjectType()->isSuperTypeOf($typeToRemove)->yes()) {
+			return $this->subtract($typeToRemove);
+		}
+
+		return null;
+	}
+
+	public function exponentiate(Type $exponent): Type
+	{
+		return $this->getStaticObjectType()->exponentiate($exponent);
+	}
+
+	public function getFiniteTypes(): array
+	{
+		return $this->getStaticObjectType()->getFiniteTypes();
+	}
+
+	public function toPhpDocNode(): TypeNode
+	{
+		return new IdentifierTypeNode('static');
+	}
+
+	public function toNativePhpTypeNode(NativeTypePosition $position)
+	{
+		if ($position->isStaticAllowed()) {
+			return new Name('static');
+		}
+
+		return $position->isClassNameAllowed() ? new Name('self') : null;
+	}
+
+	public function hasTemplateOrLateResolvableType(): bool
+	{
+		return $this->getStaticObjectType()->hasTemplateOrLateResolvableType();
+	}
+
+}

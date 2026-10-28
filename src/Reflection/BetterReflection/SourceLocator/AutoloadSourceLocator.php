@@ -1,0 +1,483 @@
+<?php 
+
+namespace PHPStan\Reflection\BetterReflection\SourceLocator;
+return;
+
+use Composer\Autoload\ClassLoader;
+use Override;
+use PhpParser\Node\Arg;
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Name;
+use PhpParser\Node\Scalar\String_;
+use PhpParser\Node\Stmt\Const_;
+use PHPStan\BetterReflection\Identifier\Identifier;
+use PHPStan\BetterReflection\Identifier\IdentifierType;
+use PHPStan\BetterReflection\Reflection\Reflection;
+use PHPStan\BetterReflection\Reflection\ReflectionConstant;
+use PHPStan\BetterReflection\Reflector\Reflector;
+use PHPStan\BetterReflection\SourceLocator\Ast\Strategy\NodeToReflection;
+use PHPStan\BetterReflection\SourceLocator\Located\LocatedSource;
+use PHPStan\BetterReflection\SourceLocator\Type\SourceLocator;
+use PHPStan\Node\Expr\TypeExpr;
+use PHPStan\Reflection\ConstantNameHelper;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Type\ConstantTypeHelper;
+use ReflectionClass;
+use ReflectionFunction;
+use Throwable;
+use function array_key_exists;
+use function array_keys;
+use function class_exists;
+use function constant;
+use function count;
+use function defined;
+use function function_exists;
+use function get_included_files;
+use function ini_get;
+use function interface_exists;
+use function is_array;
+use function is_file;
+use function is_string;
+use function opcache_invalidate;
+use function realpath;
+use function restore_error_handler;
+use function set_error_handler;
+use function spl_autoload_functions;
+use function str_contains;
+use function strtolower;
+use function trait_exists;
+use const PHP_VERSION_ID;
+
+/**
+ * Use PHP's built in autoloader to locate a class, without actually loading.
+ *
+ * There are some prerequisites...
+ *   - we expect the autoloader to load classes from a file (i.e. using require/include)
+ *
+ * Modified code from Roave/BetterReflection, Copyright (c) 2017 Roave, LLC.
+ */
+final class AutoloadSourceLocator implements SourceLocator
+{
+
+	/** @var array{classes: array<string, string>, functions: array<string, string>, constants: array<string, string>} */
+	private array $presentSymbols = [
+		'classes' => [],
+		'functions' => [],
+		'constants' => [],
+	];
+
+	/** @var array<string, true> */
+	private array $scannedFiles = [];
+
+	/** @var array<string, int> */
+	private array $startLineByClass = [];
+
+	/** How many get_included_files() entries invalidateIncludedFiles() has handled. */
+	private static int $invalidatedIncludedFilesCount = 0;
+
+	public function __construct(private FileNodesFetcher $fileNodesFetcher, private bool $executeAutoloadersInFileReadTrap)
+	{
+	}
+
+	#[Override]
+	public function locateIdentifier(Reflector $reflector, Identifier $identifier): ?Reflection
+	{
+		if ($identifier->isFunction()) {
+			$functionName = $identifier->getName();
+			$loweredFunctionName = strtolower($functionName);
+			if (array_key_exists($loweredFunctionName, $this->presentSymbols['functions'])) {
+				return $this->findReflection($reflector, $this->presentSymbols['functions'][$loweredFunctionName], $identifier, null);
+			}
+			if (!function_exists($functionName)) {
+				return null;
+			}
+
+			$reflection = new ReflectionFunction($functionName);
+			$reflectionFileName = $reflection->getFileName();
+
+			if (!is_string($reflectionFileName)) {
+				return null;
+			}
+			if (!is_file($reflectionFileName)) {
+				return null;
+			}
+
+			return $this->findReflection($reflector, $reflectionFileName, $identifier, null);
+		}
+
+		if ($identifier->isConstant()) {
+			$constantName = ConstantNameHelper::normalize($identifier->getName());
+			if (array_key_exists($constantName, $this->presentSymbols['constants'])) {
+				return $this->findReflection($reflector, $this->presentSymbols['constants'][$constantName], $identifier, null);
+			}
+
+			if (!defined($constantName)) {
+				return null;
+			}
+
+			$constantValue = @constant($constantName);
+			return ReflectionConstant::createFromNode(
+				$reflector,
+				new FuncCall(new Name('define'), [
+					new Arg(new String_($constantName)),
+					new Arg(new TypeExpr(ConstantTypeHelper::getTypeFromValue($constantValue))),
+				], [
+					'startLine' => 1,
+					'endLine' => 1,
+					'startFilePos' => 1,
+					'endFilePos' => 4,
+				]),
+				new LocatedSource('<?php', $constantName, null),
+				null,
+				null,
+			);
+		}
+
+		if (!$identifier->isClass()) {
+			return null;
+		}
+
+		$loweredClassName = strtolower($identifier->getName());
+		if (array_key_exists($loweredClassName, $this->presentSymbols['classes'])) {
+			$startLine = null;
+			if (array_key_exists($loweredClassName, $this->startLineByClass)) {
+				$startLine = $this->startLineByClass[$loweredClassName];
+			} else {
+				$reflection = $this->getReflectionClass($identifier->getName());
+				if (
+					$reflection !== null
+					&& $reflection->getStartLine() !== false
+					&& is_string($reflection->getFileName())
+					&& is_file($reflection->getFileName())
+					&& $reflection->getFileName() === $this->presentSymbols['classes'][$loweredClassName]
+				) {
+					$startLine = $reflection->getStartLine();
+				}
+			}
+			return $this->findReflection($reflector, $this->presentSymbols['classes'][$loweredClassName], $identifier, $startLine);
+		}
+		$locateResult = $this->locateClassByName($identifier->getName());
+		if ($locateResult === null) {
+			return null;
+		}
+		[$potentiallyLocatedFiles, $className, $startLine] = $locateResult;
+		if ($startLine !== null) {
+			$this->startLineByClass[strtolower($className)] = $startLine;
+		}
+
+		$newIdentifier = new Identifier($className, $identifier->getType());
+
+		foreach ($potentiallyLocatedFiles as $potentiallyLocatedFile) {
+			$reflection = $this->findReflection($reflector, $potentiallyLocatedFile, $newIdentifier, $startLine);
+			if ($reflection === null) {
+				continue;
+			}
+
+			return $reflection;
+		}
+
+		return null;
+	}
+
+	private function findReflection(Reflector $reflector, string $file, Identifier $identifier, ?int $startLine): ?Reflection
+	{
+		$result = $this->fileNodesFetcher->fetchNodes($file);
+		if (!array_key_exists($file, $this->scannedFiles)) {
+			foreach (array_keys($result->getClassNodes()) as $className) {
+				if (array_key_exists($className, $this->presentSymbols['classes'])) {
+					continue;
+				}
+				$this->presentSymbols['classes'][$className] = $file;
+			}
+			foreach (array_keys($result->getFunctionNodes()) as $functionName) {
+				if (array_key_exists($functionName, $this->presentSymbols['functions'])) {
+					continue;
+				}
+				$this->presentSymbols['functions'][$functionName] = $file;
+			}
+			foreach (array_keys($result->getConstantNodes()) as $constantName) {
+				if (array_key_exists($constantName, $this->presentSymbols['constants'])) {
+					continue;
+				}
+				$this->presentSymbols['constants'][$constantName] = $file;
+			}
+			$this->scannedFiles[$file] = true;
+		}
+
+		$nodeToReflection = new NodeToReflection();
+		if ($identifier->isClass()) {
+			$identifierName = strtolower($identifier->getName());
+			if (!array_key_exists($identifierName, $result->getClassNodes())) {
+				return null;
+			}
+
+			$classNodesCount = count($result->getClassNodes()[$identifierName]);
+			foreach ($result->getClassNodes()[$identifierName] as $classNode) {
+				if ($classNodesCount > 1 && $startLine !== null) {
+					if (count($classNode->getNode()->attrGroups) > 0 && PHP_VERSION_ID < 80000) {
+						$startLine--;
+					}
+					if ($startLine !== $classNode->getNode()->getStartLine()) {
+						continue;
+					}
+				}
+
+				return $nodeToReflection->__invoke(
+					$reflector,
+					$classNode->getNode(),
+					$classNode->getLocatedSource(),
+					$classNode->getNamespace(),
+				);
+			}
+
+			return null;
+		}
+		if ($identifier->isFunction()) {
+			$identifierName = strtolower($identifier->getName());
+			if (!array_key_exists($identifierName, $result->getFunctionNodes())) {
+				return null;
+			}
+
+			foreach ($result->getFunctionNodes()[$identifierName] as $functionNode) {
+				return $nodeToReflection->__invoke(
+					$reflector,
+					$functionNode->getNode(),
+					$functionNode->getLocatedSource(),
+					$functionNode->getNamespace(),
+				);
+			}
+		}
+
+		if ($identifier->isConstant()) {
+			$identifierName = ConstantNameHelper::normalize($identifier->getName());
+			$constantNodes = $result->getConstantNodes();
+
+			if (!array_key_exists($identifierName, $constantNodes)) {
+				return null;
+			}
+
+			foreach ($constantNodes[$identifierName] as $fetchedConstantNode) {
+				$constantNode = $fetchedConstantNode->getNode();
+
+				$positionInNode = null;
+				if ($constantNode instanceof Const_) {
+					foreach ($constantNode->consts as $constPosition => $const) {
+						if ($const->namespacedName === null) {
+							throw new ShouldNotHappenException();
+						}
+
+						if (ConstantNameHelper::normalize($const->namespacedName->toString()) === $identifierName) {
+							/** @var int $positionInNode */
+							$positionInNode = $constPosition;
+							break;
+						}
+					}
+
+					if ($positionInNode === null) {
+						throw new ShouldNotHappenException();
+					}
+				}
+
+				return $nodeToReflection->__invoke(
+					$reflector,
+					$constantNode,
+					$fetchedConstantNode->getLocatedSource(),
+					$fetchedConstantNode->getNamespace(),
+					$positionInNode,
+				);
+			}
+		}
+
+		return null;
+	}
+
+	#[Override]
+	public function locateIdentifiersByType(Reflector $reflector, IdentifierType $identifierType): array
+	{
+		return [];
+	}
+
+	/**
+	 * @return ReflectionClass<object>|null
+	 */
+	private function getReflectionClass(string $className): ?ReflectionClass
+	{
+		if (class_exists($className, false) || interface_exists($className, false) || trait_exists($className, false)) {
+			return new ReflectionClass($className);
+		}
+
+		return null;
+	}
+
+	/**
+	 * Attempt to locate a class by name.
+	 *
+	 * If class already exists, simply use internal reflection API to get the
+	 * filename and store it.
+	 *
+	 * If class does not exist, we make an assumption that whatever autoloaders
+	 * that are registered will be loading a file. We then override the file://
+	 * protocol stream wrapper to "capture" the filename we expect the class to
+	 * be in, and then restore it. Note that class_exists will cause an error
+	 * that it cannot find the file, so we squelch the errors by overriding the
+	 * error handler temporarily.
+	 *
+	 * @return array{string[], string, int|null}|null
+	 */
+	private function locateClassByName(string $className): ?array
+	{
+		$reflection = $this->getReflectionClass($className);
+		if ($reflection !== null) {
+			$filename = $reflection->getFileName();
+			if (!is_string($filename)) {
+				return null;
+			}
+			if (!is_file($filename)) {
+				return null;
+			}
+
+			return [[$filename], $reflection->getName(), $reflection->getStartLine() !== false ? $reflection->getStartLine() : null];
+		}
+
+		if (!$this->executeAutoloadersInFileReadTrap) {
+			return null;
+		}
+
+		$this->silenceErrors();
+
+		try {
+			$foundByComposer = false;
+			$result = FileReadTrapStreamWrapper::withStreamWrapperOverride(
+				static function () use ($className, &$foundByComposer): ?array {
+					$functions = spl_autoload_functions();
+					if ($functions === false) {
+						return null;
+					}
+
+					foreach ($functions as $preExistingAutoloader) {
+						$composerFile = self::findFileWithComposer($preExistingAutoloader, $className);
+						if ($composerFile !== null) {
+							$foundByComposer = true;
+							return [[$composerFile], $className, null];
+						}
+
+						self::invalidateIncludedFiles();
+
+						try {
+							$preExistingAutoloader($className);
+						} catch (Throwable) {
+							// Two unrelated throws land here, and neither one means the class was not found.
+							// The trap can serve a parse error instead of the empty script, see
+							// FileReadTrapStreamWrapper::stream_read(). And asking every registered
+							// autoloader for the class is not the order PHP uses, so an autoloader that
+							// throws for names outside its own scope throws here for names it is never
+							// invoked for at runtime. Either exception would abort the analysis of the file
+							// with an internal error, so both are swallowed - the file the autoloader asked
+							// for is recorded by the trap before the throw. Unlike AutoloadFunctionsSourceLocator,
+							// this catch does not report the message: the trap serves an empty script, so an
+							// autoloader that checks what the file declared (Symfony's DebugClassLoader) throws
+							// even for a class that the file does declare.
+						}
+
+						/**
+						 * This static variable is populated by the side-effect of the stream wrapper
+						 * trying to read the file path when `include()` is used by an autoloader.
+						 *
+						 * This will not be `null` when the autoloader tried to read a file.
+						 */
+						if (FileReadTrapStreamWrapper::$autoloadLocatedFiles !== []) {
+							return [FileReadTrapStreamWrapper::$autoloadLocatedFiles, $className, null];
+						}
+					}
+
+					return null;
+				},
+			);
+			if ($result === null) {
+				return null;
+			}
+
+			// nothing was included, so there is no trapped script to invalidate
+			if ($foundByComposer || !function_exists('opcache_invalidate')) {
+				return $result;
+			}
+
+			// the trap's empty script got compiled - and cached, with OPcache
+			// active. Where this call cannot reach the entry, the trap served a
+			// parse error instead, see FileReadTrapStreamWrapper::stream_read()
+			foreach ($result[0] as $file) {
+				opcache_invalidate($file, true);
+			}
+
+			return $result;
+		} finally {
+			restore_error_handler();
+		}
+	}
+
+	/**
+	 * Asks Composer's ClassLoader which file loadClass() would include, without
+	 * including it. With OPcache holding a file this process already ran, an
+	 * include inside the trap runs the cached script instead of the trap's empty
+	 * one, and a file declaring a function dies with "Cannot redeclare".
+	 *
+	 * A path behind a stream wrapper is left to the trap: realpath() cannot
+	 * resolve it, and the phar's own ClassLoader maps PHPStan\ to phar://.
+	 *
+	 * @param callable(string): void $autoloader
+	 */
+	private static function findFileWithComposer(callable $autoloader, string $className): ?string
+	{
+		if (!is_array($autoloader) || !$autoloader[0] instanceof ClassLoader) {
+			return null;
+		}
+
+		$file = $autoloader[0]->findFile($className);
+		if ($file === false || str_contains($file, '://')) {
+			return null;
+		}
+
+		// findFile() can return ../ segments and mixed separators; resolve them
+		// as an include would, so that locateIdentifier() can compare the path
+		// with ReflectionClass::getFileName()
+		$resolvedFile = realpath($file);
+		if ($resolvedFile === false || !is_file($resolvedFile)) {
+			return null;
+		}
+
+		return $resolvedFile;
+	}
+
+	/**
+	 * An autoloader can include a file that this process already included for real, for example a file
+	 * a bootstrap autoloader included without declaring the class. With OPcache active, the trapped
+	 * include of that file runs the script OPcache compiled from the real file, not the empty script
+	 * FileReadTrapStreamWrapper serves, and dies with "Cannot redeclare". Invalidating the entries of
+	 * the included files makes that include go through the trap. The opcache_invalidate() loop after
+	 * the trap cannot do this, because the include has already run by then. That loop removes the
+	 * empty script the trap left in OPcache.
+	 *
+	 * Only an autoloader that runs inside the trap needs this. findFileWithComposer() includes nothing.
+	 * Forked workers switch OPcache off (see ForkedProcess), so they skip this.
+	 */
+	private static function invalidateIncludedFiles(): void
+	{
+		if (!function_exists('opcache_invalidate') || !(bool) ini_get('opcache.enable') || !(bool) ini_get('opcache.enable_cli')) {
+			return;
+		}
+
+		$includedFiles = get_included_files();
+		$includedFilesCount = count($includedFiles);
+		for ($i = self::$invalidatedIncludedFilesCount; $i < $includedFilesCount; $i++) {
+			opcache_invalidate($includedFiles[$i], true);
+		}
+
+		self::$invalidatedIncludedFilesCount = $includedFilesCount;
+	}
+
+	private function silenceErrors(): void
+	{
+		set_error_handler(static fn (): bool => true);
+	}
+
+}

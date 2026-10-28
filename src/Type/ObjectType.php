@@ -1,0 +1,2157 @@
+<?php 
+
+namespace PHPStan\Type;
+return;
+
+use ArrayAccess;
+use ArrayObject;
+use Closure;
+use Countable;
+use DateTimeInterface;
+use Iterator;
+use IteratorAggregate;
+use PhpParser\Node\Name\FullyQualified;
+use PHPStan\Analyser\OutOfClassScope;
+use PHPStan\Broker\ClassNotFoundException;
+use PHPStan\Internal\LruCache;
+use PHPStan\Php\PhpVersion;
+use PHPStan\PhpDocParser\Ast\Type\FullyQualifiedNameNode;
+use PHPStan\PhpDocParser\Ast\Type\TypeNode;
+use PHPStan\Reflection\Callables\CallableParametersAcceptor;
+use PHPStan\Reflection\Callables\FunctionCallableVariant;
+use PHPStan\Reflection\ClassConstantReflection;
+use PHPStan\Reflection\ClassMemberAccessAnswerer;
+use PHPStan\Reflection\ClassReflection;
+use PHPStan\Reflection\Dummy\DummyPropertyReflection;
+use PHPStan\Reflection\ExtendedMethodReflection;
+use PHPStan\Reflection\ExtendedPropertyReflection;
+use PHPStan\Reflection\Php\UniversalObjectCratesClassReflectionExtension;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Reflection\ReflectionProviderStaticAccessor;
+use PHPStan\Reflection\TrivialParametersAcceptor;
+use PHPStan\Reflection\Type\CallbackUnresolvedPropertyPrototypeReflection;
+use PHPStan\Reflection\Type\CalledOnTypeUnresolvedMethodPrototypeReflection;
+use PHPStan\Reflection\Type\CalledOnTypeUnresolvedPropertyPrototypeReflection;
+use PHPStan\Reflection\Type\UnionTypeUnresolvedPropertyPrototypeReflection;
+use PHPStan\Reflection\Type\UnresolvedMethodPrototypeReflection;
+use PHPStan\Reflection\Type\UnresolvedPropertyPrototypeReflection;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\TrinaryLogic;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\Accessory\AccessoryLiteralStringType;
+use PHPStan\Type\Accessory\AccessoryNonEmptyStringType;
+use PHPStan\Type\Accessory\AccessoryNumericStringType;
+use PHPStan\Type\Accessory\HasOffsetValueType;
+use PHPStan\Type\Constant\ConstantArrayType;
+use PHPStan\Type\Constant\ConstantBooleanType;
+use PHPStan\Type\Constant\ConstantStringType;
+use PHPStan\Type\Enum\EnumCaseObjectType;
+use PHPStan\Type\Generic\GenericClassStringType;
+use PHPStan\Type\Generic\GenericObjectType;
+use PHPStan\Type\Generic\TemplateTypeHelper;
+use PHPStan\Type\Generic\UnresolvedTemplateArgumentType;
+use PHPStan\Type\Traits\MaybeIterableTypeTrait;
+use PHPStan\Type\Traits\NonArrayTypeTrait;
+use PHPStan\Type\Traits\NonGeneralizableTypeTrait;
+use PHPStan\Type\Traits\NonGenericTypeTrait;
+use PHPStan\Type\Traits\SubstractableTypeTrait;
+use PHPStan\Type\Traits\UndecidedComparisonTypeTrait;
+use Stringable;
+use Throwable;
+use Traversable;
+use function array_key_exists;
+use function array_map;
+use function array_merge;
+use function array_values;
+use function count;
+use function get_class;
+use function implode;
+use function in_array;
+use function sprintf;
+use function strtolower;
+
+/** @api */
+#[InstanceofDeprecated(insteadUse: 'Type::isObject() or Type::getObjectClassNames()')]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/ObjectType.cpp')]
+class ObjectType implements TypeWithClassName, SubtractableType
+{
+
+	use MaybeIterableTypeTrait;
+	use NonArrayTypeTrait;
+	use NonGenericTypeTrait;
+	use UndecidedComparisonTypeTrait;
+	use NonGeneralizableTypeTrait;
+	use SubstractableTypeTrait;
+
+	private const DESCRIPTION_CACHE_LIMIT = 1024;
+
+	private const EXTRA_OFFSET_CLASSES = [
+		'DOMNamedNodeMap', // Only read and existence
+		'Dom\NamedNodeMap', // Only read and existence
+		'DOMNodeList', // Only read and existence
+		'Dom\NodeList', // Only read and existence
+		'Dom\HTMLCollection', // Only read and existence
+		'Dom\DtdNamedNodeMap', // Only read and existence
+		'PDORow', // Only read and existence
+		'ResourceBundle', // Only read
+		'FFI\CData', // Very funky and weird
+		'SimpleXMLElement',
+		'Threaded',
+	];
+
+	private ?Type $subtractedType;
+
+	/** @var array<string, array<string, IsSuperTypeOfResult>> */
+	private static array $superTypes = [];
+
+	private ?self $cachedParent = null;
+
+	/** @var self[]|null */
+	private ?array $cachedInterfaces = null;
+
+	/** @var array<string, array<string, array<string, UnresolvedMethodPrototypeReflection>>> */
+	private static array $methods = [];
+
+	/** @var array<string, array<string, array<string, UnresolvedPropertyPrototypeReflection>>> */
+	private static array $properties = [];
+
+	/** @var array<string, array<string, array<string, UnresolvedPropertyPrototypeReflection>>> */
+	private static array $instanceProperties = [];
+
+	/** @var array<string, array<string, array<string, UnresolvedPropertyPrototypeReflection>>> */
+	private static array $staticProperties = [];
+
+	/** @var array<string, array<string, self|null>> */
+	private static array $ancestors = [];
+
+	/** @var array<string, self|null> */
+	private array $currentAncestors = [];
+
+	private ?string $cachedDescription = null;
+
+	/**
+	 * The class name as the reflection spells it - the properly cased name, or the
+	 * readable `class@anonymous...` form. Resolving it takes two ReflectionProvider
+	 * round-trips and both the type-only and the value level need it, the latter on
+	 * every operation RecursionGuard guards.
+	 */
+	private ?string $cachedPreciseName = null;
+
+	/**
+	 * The reflection resolved on demand by getClassReflection(), kept apart from the one
+	 * handed to the constructor. The constructor's reflection is part of the type's value
+	 * — it can differ from what the provider would return (an anonymous class is identified
+	 * by its start line, a final-by-keyword override changes subtyping) — and so it belongs
+	 * in the cache key. A lazily fetched one is merely a cache: folding it into the key made
+	 * describe(VerbosityLevel::cache()) depend on whether the fetch had happened yet, which
+	 * made TypeCombinator::union() — which dedupes on that key — depend on cache warmth
+	 * rather than on its arguments' values.
+	 */
+	private ?ClassReflection $lazyClassReflection = null;
+
+	/** @var array<string, list<EnumCaseObjectType>> */
+	private static array $enumCases = [];
+
+	/** @var LruCache<true>|null shared LRU over the description keys of the static caches above */
+	private static ?LruCache $descriptionCacheOrder = null;
+
+	/** consecutive lookups mostly touch the same description — skip the LRU bookkeeping for them */
+	private static ?string $lastTouchedDescription = null;
+
+	/** @var array<string, ExtendedMethodReflection> */
+	private array $methodCache = [];
+
+	/** @api */
+	public function __construct(
+		private string $className,
+		?Type $subtractedType = null,
+		private ?ClassReflection $classReflection = null,
+	)
+	{
+		if ($subtractedType instanceof NeverType) {
+			$subtractedType = null;
+		}
+
+		$this->subtractedType = $subtractedType;
+	}
+
+	public static function resetCaches(): void
+	{
+		self::$superTypes = [];
+		self::$methods = [];
+		self::$properties = [];
+		self::$instanceProperties = [];
+		self::$staticProperties = [];
+		self::$ancestors = [];
+		self::$enumCases = [];
+		self::$descriptionCacheOrder = null;
+		self::$lastTouchedDescription = null;
+	}
+
+	/**
+	 * Moves the description to the most-recently-used position of the shared LRU
+	 * governing the static caches above; evicts the least recently used description's
+	 * entries from all of them once the limit is reached. Misses are pure recomputation.
+	 */
+	private static function touchDescriptionCacheKey(string $description): void
+	{
+		if ($description === self::$lastTouchedDescription) {
+			return;
+		}
+		self::$lastTouchedDescription = $description;
+
+		self::$descriptionCacheOrder ??= new LruCache(self::DESCRIPTION_CACHE_LIMIT);
+		if (self::$descriptionCacheOrder->get($description) !== null) {
+			return;
+		}
+
+		foreach (self::$descriptionCacheOrder->set($description, true, 0) as $evictKey) {
+			unset(
+				self::$superTypes[$evictKey],
+				self::$methods[$evictKey],
+				self::$properties[$evictKey],
+				self::$instanceProperties[$evictKey],
+				self::$staticProperties[$evictKey],
+				self::$ancestors[$evictKey],
+				self::$enumCases[$evictKey],
+			);
+		}
+	}
+
+	public function getClassName(): string
+	{
+		return $this->className;
+	}
+
+	public function hasProperty(string $propertyName): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		$classHasProperty = RecursionGuard::run($this, static fn (): bool => $classReflection->hasProperty($propertyName));
+		if ($classHasProperty === true || $classHasProperty instanceof ErrorType) {
+			return TrinaryLogic::createYes();
+		}
+
+		if ($classReflection->allowsDynamicProperties()) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		if (!$classReflection->isFinal()) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		return TrinaryLogic::createNo();
+	}
+
+	public function getProperty(string $propertyName, ClassMemberAccessAnswerer $scope): ExtendedPropertyReflection
+	{
+		return $this->getUnresolvedPropertyPrototype($propertyName, $scope)->getTransformedProperty();
+	}
+
+	public function getUnresolvedPropertyPrototype(string $propertyName, ClassMemberAccessAnswerer $scope): UnresolvedPropertyPrototypeReflection
+	{
+		if (!$scope->isInClass()) {
+			$canAccessProperty = 'no';
+		} else {
+			$canAccessProperty = $scope->getClassReflection()->getName();
+		}
+		$description = $this->describeCache();
+
+		self::touchDescriptionCacheKey($description);
+
+		if (isset(self::$properties[$description][$propertyName][$canAccessProperty])) {
+			return self::$properties[$description][$propertyName][$canAccessProperty];
+		}
+
+		$nakedClassReflection = $this->getNakedClassReflection();
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		if ($nakedClassReflection->isEnum()) {
+			if (
+				$propertyName === 'name'
+				|| ($propertyName === 'value' && $nakedClassReflection->isBackedEnum())
+			) {
+				$properties = [];
+				foreach ($this->getEnumCases() as $enumCase) {
+					$properties[] = $enumCase->getUnresolvedPropertyPrototype($propertyName, $scope);
+				}
+
+				if (count($properties) > 0) {
+					if (count($properties) === 1) {
+						return $properties[0];
+					}
+
+					return new UnionTypeUnresolvedPropertyPrototypeReflection($properties);
+				}
+			}
+		}
+
+		if (!$nakedClassReflection->hasNativeProperty($propertyName)) {
+			$nakedClassReflection = $this->getClassReflection();
+		}
+
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		$property = RecursionGuard::run($this, static fn () => $nakedClassReflection->getProperty($propertyName, $scope));
+		if ($property instanceof ErrorType) {
+			$property = new DummyPropertyReflection($propertyName);
+
+			return new CallbackUnresolvedPropertyPrototypeReflection(
+				$property,
+				$property->getDeclaringClass(),
+				false,
+				static fn (Type $type): Type => $type,
+			);
+		}
+
+		$ancestor = $this->getAncestorWithClassName($property->getDeclaringClass()->getName());
+		$resolvedClassReflection = null;
+		if ($ancestor !== null && $ancestor->hasProperty($propertyName)->yes()) {
+			$resolvedClassReflection = $ancestor->getClassReflection();
+			if ($ancestor !== $this) {
+				$property = $ancestor->getUnresolvedPropertyPrototype($propertyName, $scope)->getNakedProperty();
+			}
+		}
+		if ($resolvedClassReflection === null) {
+			$resolvedClassReflection = $property->getDeclaringClass();
+		}
+
+		return self::$properties[$description][$propertyName][$canAccessProperty] = new CalledOnTypeUnresolvedPropertyPrototypeReflection(
+			$property,
+			$resolvedClassReflection,
+			true,
+			$this,
+		);
+	}
+
+	public function hasInstanceProperty(string $propertyName): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		$classHasProperty = RecursionGuard::run($this, static fn (): bool => $classReflection->hasInstanceProperty($propertyName));
+		if ($classHasProperty === true || $classHasProperty instanceof ErrorType) {
+			return TrinaryLogic::createYes();
+		}
+
+		if ($classReflection->allowsDynamicProperties()) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		if (!$classReflection->isFinal()) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		return TrinaryLogic::createNo();
+	}
+
+	public function getInstanceProperty(string $propertyName, ClassMemberAccessAnswerer $scope): ExtendedPropertyReflection
+	{
+		return $this->getUnresolvedInstancePropertyPrototype($propertyName, $scope)->getTransformedProperty();
+	}
+
+	public function getUnresolvedInstancePropertyPrototype(string $propertyName, ClassMemberAccessAnswerer $scope): UnresolvedPropertyPrototypeReflection
+	{
+		if (!$scope->isInClass()) {
+			$canAccessProperty = 'no';
+		} else {
+			$canAccessProperty = $scope->getClassReflection()->getName();
+		}
+		$description = $this->describeCache();
+
+		self::touchDescriptionCacheKey($description);
+
+		if (isset(self::$instanceProperties[$description][$propertyName][$canAccessProperty])) {
+			return self::$instanceProperties[$description][$propertyName][$canAccessProperty];
+		}
+
+		$nakedClassReflection = $this->getNakedClassReflection();
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		if ($nakedClassReflection->isEnum()) {
+			if (
+				$propertyName === 'name'
+				|| ($propertyName === 'value' && $nakedClassReflection->isBackedEnum())
+			) {
+				$properties = [];
+				foreach ($this->getEnumCases() as $enumCase) {
+					$properties[] = $enumCase->getUnresolvedInstancePropertyPrototype($propertyName, $scope);
+				}
+
+				if (count($properties) > 0) {
+					if (count($properties) === 1) {
+						return $properties[0];
+					}
+
+					return new UnionTypeUnresolvedPropertyPrototypeReflection($properties);
+				}
+			}
+		}
+
+		if (!$nakedClassReflection->hasNativeProperty($propertyName)) {
+			$nakedClassReflection = $this->getClassReflection();
+		}
+
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		$property = RecursionGuard::run($this, static fn () => $nakedClassReflection->getInstanceProperty($propertyName, $scope));
+		if ($property instanceof ErrorType) {
+			$property = new DummyPropertyReflection($propertyName);
+
+			return new CallbackUnresolvedPropertyPrototypeReflection(
+				$property,
+				$property->getDeclaringClass(),
+				false,
+				static fn (Type $type): Type => $type,
+			);
+		}
+
+		$ancestor = $this->getAncestorWithClassName($property->getDeclaringClass()->getName());
+		$resolvedClassReflection = null;
+		if ($ancestor !== null && $ancestor->hasInstanceProperty($propertyName)->yes()) {
+			$resolvedClassReflection = $ancestor->getClassReflection();
+			if ($ancestor !== $this) {
+				$property = $ancestor->getUnresolvedInstancePropertyPrototype($propertyName, $scope)->getNakedProperty();
+			}
+		}
+		if ($resolvedClassReflection === null) {
+			$resolvedClassReflection = $property->getDeclaringClass();
+		}
+
+		return self::$instanceProperties[$description][$propertyName][$canAccessProperty] = new CalledOnTypeUnresolvedPropertyPrototypeReflection(
+			$property,
+			$resolvedClassReflection,
+			true,
+			$this,
+		);
+	}
+
+	public function hasStaticProperty(string $propertyName): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		$classHasProperty = RecursionGuard::run($this, static fn (): bool => $classReflection->hasStaticProperty($propertyName));
+		if ($classHasProperty === true || $classHasProperty instanceof ErrorType) {
+			return TrinaryLogic::createYes();
+		}
+
+		if (!$classReflection->isFinal()) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		return TrinaryLogic::createNo();
+	}
+
+	public function getStaticProperty(string $propertyName, ClassMemberAccessAnswerer $scope): ExtendedPropertyReflection
+	{
+		return $this->getUnresolvedStaticPropertyPrototype($propertyName, $scope)->getTransformedProperty();
+	}
+
+	public function getUnresolvedStaticPropertyPrototype(string $propertyName, ClassMemberAccessAnswerer $scope): UnresolvedPropertyPrototypeReflection
+	{
+		if (!$scope->isInClass()) {
+			$canAccessProperty = 'no';
+		} else {
+			$canAccessProperty = $scope->getClassReflection()->getName();
+		}
+		$description = $this->describeCache();
+
+		self::touchDescriptionCacheKey($description);
+
+		if (isset(self::$staticProperties[$description][$propertyName][$canAccessProperty])) {
+			return self::$staticProperties[$description][$propertyName][$canAccessProperty];
+		}
+
+		$nakedClassReflection = $this->getNakedClassReflection();
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		if (!$nakedClassReflection->hasNativeProperty($propertyName)) {
+			$nakedClassReflection = $this->getClassReflection();
+		}
+
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		$property = RecursionGuard::run($this, static fn () => $nakedClassReflection->getStaticProperty($propertyName));
+		if ($property instanceof ErrorType) {
+			$property = new DummyPropertyReflection($propertyName);
+
+			return new CallbackUnresolvedPropertyPrototypeReflection(
+				$property,
+				$property->getDeclaringClass(),
+				false,
+				static fn (Type $type): Type => $type,
+			);
+		}
+
+		$ancestor = $this->getAncestorWithClassName($property->getDeclaringClass()->getName());
+		$resolvedClassReflection = null;
+		if ($ancestor !== null && $ancestor->hasStaticProperty($propertyName)->yes()) {
+			$resolvedClassReflection = $ancestor->getClassReflection();
+			if ($ancestor !== $this) {
+				$property = $ancestor->getUnresolvedStaticPropertyPrototype($propertyName, $scope)->getNakedProperty();
+			}
+		}
+		if ($resolvedClassReflection === null) {
+			$resolvedClassReflection = $property->getDeclaringClass();
+		}
+
+		return self::$staticProperties[$description][$propertyName][$canAccessProperty] = new CalledOnTypeUnresolvedPropertyPrototypeReflection(
+			$property,
+			$resolvedClassReflection,
+			true,
+			$this,
+		);
+	}
+
+	public function getReferencedClasses(): array
+	{
+		if ($this->className === '') {
+			return [];
+		}
+
+		return [$this->className];
+	}
+
+	public function getObjectClassNames(): array
+	{
+		if ($this->className === '') {
+			return [];
+		}
+		return [$this->className];
+	}
+
+	public function getObjectClassReflections(): array
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return [];
+		}
+
+		return [$classReflection];
+	}
+
+	public function accepts(Type $type, bool $strictTypes): AcceptsResult
+	{
+		if ($type instanceof StaticType) {
+			return $this->checkSubclassAcceptability($type->getClassName());
+		}
+
+		if ($type instanceof CompoundType) {
+			return $type->isAcceptedBy($this, $strictTypes);
+		}
+
+		if ($type instanceof ClosureType) {
+			return new AcceptsResult($this->isInstanceOf(Closure::class), []);
+		}
+
+		if ($type instanceof ObjectWithoutClassType) {
+			return AcceptsResult::createMaybe();
+		}
+
+		$thatClassNames = $type->getObjectClassNames();
+		if (count($thatClassNames) > 1) {
+			throw new ShouldNotHappenException();
+		}
+
+		if ($thatClassNames === []) {
+			return AcceptsResult::createNo();
+		}
+
+		return $this->checkSubclassAcceptability($thatClassNames[0]);
+	}
+
+	public function isSuperTypeOf(Type $type): IsSuperTypeOfResult
+	{
+		$thatClassNames = $type->getObjectClassNames();
+		if (!$type instanceof CompoundType && $thatClassNames === [] && !$type instanceof ObjectWithoutClassType) {
+			return IsSuperTypeOfResult::createNo();
+		}
+
+		$thisDescription = $this->describeCache();
+
+		if ($type instanceof self) {
+			$description = $type->describeCache();
+		} else {
+			$description = $type->describe(VerbosityLevel::cache());
+		}
+
+		self::touchDescriptionCacheKey($thisDescription);
+
+		if (isset(self::$superTypes[$thisDescription][$description])) {
+			return self::$superTypes[$thisDescription][$description];
+		}
+
+		if ($type instanceof CompoundType) {
+			return self::$superTypes[$thisDescription][$description] = $type->isSubTypeOf($this);
+		}
+
+		if ($type instanceof ClosureType) {
+			return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createFromTrinaryLogic($this->isInstanceOf(Closure::class));
+		}
+
+		if ($type instanceof ObjectWithoutClassType) {
+			if ($type->getSubtractedType() !== null) {
+				$isSuperType = $type->getSubtractedType()->isSuperTypeOf($this);
+				if ($isSuperType->yes()) {
+					return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createNo();
+				}
+			}
+			return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createMaybe();
+		}
+
+		$transformResult = static fn (IsSuperTypeOfResult $result) => $result;
+		if ($this->subtractedType !== null) {
+			$isSuperType = $this->subtractedType->isSuperTypeOf($type);
+			if ($isSuperType->yes()) {
+				return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createNo();
+			}
+			if ($isSuperType->maybe()) {
+				$transformResult = static fn (IsSuperTypeOfResult $result) => $result->and(IsSuperTypeOfResult::createMaybe());
+			}
+		}
+
+		if (
+			$type instanceof SubtractableType
+			&& $type->getSubtractedType() !== null
+		) {
+			$isSuperType = $type->getSubtractedType()->isSuperTypeOf($this);
+			if ($isSuperType->yes()) {
+				return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createNo();
+			}
+		}
+
+		$thisClassName = $this->className;
+		if (count($thatClassNames) > 1) {
+			throw new ShouldNotHappenException();
+		}
+
+		$thisClassReflection = $this->getClassReflection();
+		$thatClassReflections = $type->getObjectClassReflections();
+		if (count($thatClassReflections) === 1) {
+			$thatClassReflection = $thatClassReflections[0];
+		} else {
+			$thatClassReflection = null;
+		}
+
+		if ($thisClassReflection === null || $thatClassReflection === null) {
+			if ($thatClassNames[0] === $thisClassName) {
+				return self::$superTypes[$thisDescription][$description] = $transformResult(IsSuperTypeOfResult::createYes());
+			}
+			return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createMaybe();
+		}
+
+		if ($thatClassNames[0] === $thisClassName) {
+			if ($thisClassReflection->getNativeReflection()->isFinal()) {
+				return self::$superTypes[$thisDescription][$description] = $transformResult(IsSuperTypeOfResult::createYes());
+			}
+
+			if ($thisClassReflection->hasFinalByKeywordOverride()) {
+				if (!$thatClassReflection->hasFinalByKeywordOverride()) {
+					return self::$superTypes[$thisDescription][$description] = $transformResult(IsSuperTypeOfResult::createMaybe());
+				}
+			}
+
+			return self::$superTypes[$thisDescription][$description] = $transformResult(IsSuperTypeOfResult::createYes());
+		}
+
+		if ($thisClassReflection->isTrait() || $thatClassReflection->isTrait()) {
+			return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createNo();
+		}
+
+		if ($thisClassReflection->getName() === $thatClassReflection->getName()) {
+			return self::$superTypes[$thisDescription][$description] = $transformResult(IsSuperTypeOfResult::createYes());
+		}
+
+		if ($thatClassReflection->isSubclassOfClass($thisClassReflection)) {
+			return self::$superTypes[$thisDescription][$description] = $transformResult(IsSuperTypeOfResult::createYes());
+		}
+
+		if ($thisClassReflection->isSubclassOfClass($thatClassReflection)) {
+			return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createMaybe();
+		}
+
+		if ($thisClassReflection->isInterface() && !$thatClassReflection->isFinalByKeyword()) {
+			return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createMaybe();
+		}
+
+		if ($thatClassReflection->isInterface() && !$thisClassReflection->isFinalByKeyword()) {
+			return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createMaybe();
+		}
+
+		return self::$superTypes[$thisDescription][$description] = IsSuperTypeOfResult::createNo();
+	}
+
+	public function equals(Type $type): bool
+	{
+		if (get_class($type) !== static::class) {
+			return false;
+		}
+
+		if ($this->className !== $type->className) {
+			return false;
+		}
+
+		if ($this->subtractedType === null) {
+			return $type->subtractedType === null;
+		}
+
+		if ($type->subtractedType === null) {
+			return false;
+		}
+
+		return $this->subtractedType->equals($type->subtractedType);
+	}
+
+	private function checkSubclassAcceptability(string $thatClass): AcceptsResult
+	{
+		if ($this->className === $thatClass) {
+			return AcceptsResult::createYes();
+		}
+
+		$reflectionProvider = ReflectionProviderStaticAccessor::getInstance();
+
+		if ($this->getClassReflection() === null || !$reflectionProvider->hasClass($thatClass)) {
+			return AcceptsResult::createNo();
+		}
+
+		$thisReflection = $this->getClassReflection();
+		$thatReflection = $reflectionProvider->getClass($thatClass);
+
+		if ($thisReflection->getName() === $thatReflection->getName()) {
+			// class alias
+			return AcceptsResult::createYes();
+		}
+
+		if ($thisReflection->isInterface() && $thatReflection->isInterface()) {
+			return AcceptsResult::createFromBoolean(
+				$thatReflection->implementsInterface($thisReflection->getName()),
+			);
+		}
+
+		return AcceptsResult::createFromBoolean(
+			$thatReflection->isSubclassOfClass($thisReflection),
+		);
+	}
+
+	public function describe(VerbosityLevel $level): string
+	{
+		if ($this->cachedPreciseName !== null && ($level->isValue() || $level->isTypeOnly())) {
+			return $this->cachedPreciseName;
+		}
+
+		$preciseNameCallback = function (): string {
+			if ($this->cachedPreciseName !== null) {
+				return $this->cachedPreciseName;
+			}
+
+			$reflectionProvider = ReflectionProviderStaticAccessor::getInstance();
+			if (!$reflectionProvider->hasClass($this->className)) {
+				return $this->cachedPreciseName = $this->className;
+			}
+
+			return $this->cachedPreciseName = $reflectionProvider->getClassName($this->className);
+		};
+
+		$preciseWithSubtracted = fn (): string => $this->className . $this->describeSubtractedType($this->subtractedType, $level);
+
+		return $level->handle(
+			$preciseNameCallback,
+			$preciseNameCallback,
+			$preciseWithSubtracted,
+			function () use ($preciseWithSubtracted): string {
+				$reflection = $this->classReflection;
+				$line = '';
+				if ($reflection !== null) {
+					$line .= '-';
+					$line .= (string) $reflection->getNativeReflection()->getStartLine();
+					$line .= '-';
+				}
+
+				return $preciseWithSubtracted() . '-' . static::class . '-' . $line . $this->describeAdditionalCacheKey();
+			},
+		);
+	}
+
+	protected function describeAdditionalCacheKey(): string
+	{
+		return '';
+	}
+
+	private function describeCache(): string
+	{
+		if ($this->cachedDescription !== null) {
+			return $this->cachedDescription;
+		}
+
+		if (static::class !== self::class) {
+			return $this->cachedDescription = $this->describe(VerbosityLevel::cache());
+		}
+
+		$description = $this->className;
+
+		if ($this instanceof GenericObjectType) {
+			$description .= '<';
+			$typeDescriptions = [];
+			foreach ($this->getTypes() as $type) {
+				$typeDescriptions[] = $type->describe(VerbosityLevel::cache());
+			}
+			$description .= '<' . implode(', ', $typeDescriptions) . '>';
+		}
+
+		$description .= $this->describeSubtractedType($this->subtractedType, VerbosityLevel::cache());
+
+		$reflection = $this->classReflection;
+		if ($reflection !== null) {
+			$description .= '-';
+			$description .= (string) $reflection->getNativeReflection()->getStartLine();
+			$description .= '-';
+
+			if ($reflection->hasFinalByKeywordOverride()) {
+				$description .= 'f=' . ($reflection->isFinalByKeyword() ? 't' : 'f');
+			}
+		}
+
+		return $this->cachedDescription = $description;
+	}
+
+	public function toNumber(): Type
+	{
+		if (
+			$this->isInstanceOf('SimpleXMLElement')->yes()
+			|| $this->isInstanceOf('GMP')->yes()
+		) {
+			return new UnionType([
+				new FloatType(),
+				new IntegerType(),
+			]);
+		}
+
+		return new ErrorType();
+	}
+
+	public function toBitwiseNotType(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toGetClassResultType(): Type
+	{
+		return $this->getClassStringType();
+	}
+
+	public function toClassConstantType(ReflectionProvider $reflectionProvider): Type
+	{
+		if ($reflectionProvider->hasClass($this->className)) {
+			$reflection = $reflectionProvider->getClass($this->className);
+			if ($reflection->isFinalByKeyword()) {
+				return new ConstantStringType($reflection->getName(), true);
+			}
+		}
+
+		return new IntersectionType([$this->getClassStringType(), new AccessoryLiteralStringType()]);
+	}
+
+	public function toObjectTypeForInstanceofCheck(): ClassNameToObjectTypeResult
+	{
+		return new ClassNameToObjectTypeResult($this, true);
+	}
+
+	public function toObjectTypeForIsACheck(Type $objectOrClassType, bool $allowString, bool $allowSameClass): ClassNameToObjectTypeResult
+	{
+		if ($allowString) {
+			return new ClassNameToObjectTypeResult(
+				new UnionType([new ObjectWithoutClassType(), new ClassStringType()]),
+				false,
+			);
+		}
+
+		return new ClassNameToObjectTypeResult(new ObjectWithoutClassType(), false);
+	}
+
+	public function toAbsoluteNumber(): Type
+	{
+		return $this->toNumber()->toAbsoluteNumber();
+	}
+
+	public function toInteger(): Type
+	{
+		if (
+			$this->isInstanceOf('SimpleXMLElement')->yes()
+			|| $this->isInstanceOf('GMP')->yes()
+		) {
+			return new IntegerType();
+		}
+
+		if (in_array($this->getClassName(), ['CurlHandle', 'CurlMultiHandle'], true)) {
+			return new IntegerType();
+		}
+
+		return new ErrorType();
+	}
+
+	public function toFloat(): Type
+	{
+		if (
+			$this->isInstanceOf('SimpleXMLElement')->yes()
+			|| $this->isInstanceOf('GMP')->yes()
+		) {
+			return new FloatType();
+		}
+		return new ErrorType();
+	}
+
+	public function toString(): Type
+	{
+		if (
+			$this->isInstanceOf('BcMath\Number')->yes()
+			|| $this->isInstanceOf('GMP')->yes()
+		) {
+			return new IntersectionType([
+				new StringType(),
+				new AccessoryNumericStringType(),
+				new AccessoryNonEmptyStringType(),
+			]);
+		}
+
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return new ErrorType();
+		}
+
+		if ($classReflection->hasNativeMethod('__toString')) {
+			return $this->getMethod('__toString', new OutOfClassScope())->getOnlyVariant()->getReturnType();
+		}
+
+		return new ErrorType();
+	}
+
+	public function toArray(): Type
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return new ArrayType(new MixedType(), new MixedType());
+		}
+
+		$reflectionProvider = ReflectionProviderStaticAccessor::getInstance();
+
+		if (
+			!$classReflection->getNativeReflection()->isUserDefined()
+			|| $classReflection->is(ArrayObject::class)
+			|| UniversalObjectCratesClassReflectionExtension::isUniversalObjectCrate(
+				$reflectionProvider,
+				$classReflection,
+			)
+		) {
+			return new ArrayType(new MixedType(), new MixedType());
+		}
+		$arrayKeys = [];
+		$arrayValues = [];
+
+		$isFinal = $classReflection->isFinal();
+
+		do {
+			foreach ($classReflection->getNativeReflection()->getProperties() as $nativeProperty) {
+				if ($nativeProperty->isStatic()) {
+					continue;
+				}
+
+				$declaringClass = $reflectionProvider->getClass($nativeProperty->getDeclaringClass()->getName());
+				$property = $declaringClass->getNativeProperty($nativeProperty->getName());
+
+				$keyName = $nativeProperty->getName();
+				if ($nativeProperty->isPrivate()) {
+					$keyName = sprintf(
+						"\0%s\0%s",
+						$declaringClass->getName(),
+						$keyName,
+					);
+				} elseif ($nativeProperty->isProtected()) {
+					$keyName = sprintf(
+						"\0*\0%s",
+						$keyName,
+					);
+				}
+
+				$arrayKeys[] = new ConstantStringType($keyName);
+				$arrayValues[] = $property->getReadableType();
+			}
+
+			$classReflection = $classReflection->getParentClass();
+		} while ($classReflection !== null);
+
+		if (!$isFinal) {
+			if (count($arrayKeys) === 0 || count($arrayKeys) > 16) {
+				return new ArrayType(new MixedType(), new MixedType());
+			}
+
+			$types = [new ArrayType(new MixedType(), new MixedType())];
+			foreach ($arrayKeys as $i => $arrayKey) {
+				$types[] = new HasOffsetValueType($arrayKey, $arrayValues[$i]);
+			}
+
+			return new IntersectionType($types);
+		}
+
+		return new ConstantArrayType($arrayKeys, $arrayValues);
+	}
+
+	public function toArrayKey(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function toCoercedArgumentType(bool $strictTypes): Type
+	{
+		if (!$strictTypes) {
+			$classReflection = $this->getClassReflection();
+			if (
+				$classReflection === null
+				|| !$classReflection->hasNativeMethod('__toString')
+			) {
+				return $this;
+			}
+
+			return TypeCombinator::union($this, $this->toString());
+		}
+
+		return $this;
+	}
+
+	public function toBoolean(): BooleanType
+	{
+		if (
+			$this->isInstanceOf('SimpleXMLElement')->yes()
+			|| $this->isInstanceOf('BcMath\Number')->yes()
+			|| $this->isInstanceOf('GMP')->yes()
+		) {
+			return new BooleanType();
+		}
+
+		return new ConstantBooleanType(true);
+	}
+
+	public function isObject(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function getClassStringType(): Type
+	{
+		return new GenericClassStringType($this);
+	}
+
+	public function isEnum(): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		if (
+			$classReflection->isEnum()
+			|| $classReflection->is('UnitEnum')
+		) {
+			return TrinaryLogic::createYes();
+		}
+
+		if (
+			$classReflection->isInterface()
+			&& !$classReflection->is(Stringable::class) // enums cannot have __toString
+			&& !$classReflection->is(Throwable::class) // enums cannot extend Exception/Error
+			&& !$classReflection->is(DateTimeInterface::class) // userland classes cannot extend DateTimeInterface
+		) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		return TrinaryLogic::createNo();
+	}
+
+	public function canAccessProperties(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function canCallMethods(): TrinaryLogic
+	{
+		if (strtolower($this->className) === 'stdclass') {
+			return TrinaryLogic::createNo();
+		}
+
+		return TrinaryLogic::createYes();
+	}
+
+	public function hasMethod(string $methodName): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		if ($classReflection->hasMethod($methodName)) {
+			return TrinaryLogic::createYes();
+		}
+
+		if ($classReflection->isFinal()) {
+			return TrinaryLogic::createNo();
+		}
+
+		return TrinaryLogic::createMaybe();
+	}
+
+	public function getMethod(string $methodName, ClassMemberAccessAnswerer $scope): ExtendedMethodReflection
+	{
+		$key = $methodName;
+		if ($scope->isInClass()) {
+			$key = sprintf('%s-%s', $key, $scope->getClassReflection()->getCacheKey());
+		}
+		return $this->methodCache[$key] ??= $this->getUnresolvedMethodPrototype($methodName, $scope)->getTransformedMethod();
+	}
+
+	public function getUnresolvedMethodPrototype(string $methodName, ClassMemberAccessAnswerer $scope): UnresolvedMethodPrototypeReflection
+	{
+		if (!$scope->isInClass()) {
+			$canCallMethod = 'no';
+		} else {
+			$canCallMethod = $scope->getClassReflection()->getName();
+		}
+		$description = $this->describeCache();
+		self::touchDescriptionCacheKey($description);
+		if (isset(self::$methods[$description][$methodName][$canCallMethod])) {
+			return self::$methods[$description][$methodName][$canCallMethod];
+		}
+
+		$nakedClassReflection = $this->getNakedClassReflection();
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		if (!$nakedClassReflection->hasNativeMethod($methodName)) {
+			$nakedClassReflection = $this->getClassReflection();
+		}
+
+		if ($nakedClassReflection === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		$method = $nakedClassReflection->getMethod($methodName, $scope);
+
+		$ancestor = $this->getAncestorWithClassName($method->getDeclaringClass()->getName());
+		$resolvedClassReflection = null;
+		if ($ancestor !== null) {
+			$resolvedClassReflection = $ancestor->getClassReflection();
+			if ($ancestor !== $this) {
+				$method = $ancestor->getUnresolvedMethodPrototype($methodName, $scope)->getNakedMethod();
+			}
+		}
+		if ($resolvedClassReflection === null) {
+			$resolvedClassReflection = $method->getDeclaringClass();
+		}
+
+		return self::$methods[$description][$methodName][$canCallMethod] = new CalledOnTypeUnresolvedMethodPrototypeReflection(
+			$method,
+			$resolvedClassReflection,
+			true,
+			$this,
+		);
+	}
+
+	public function canAccessConstants(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function hasConstant(string $constantName): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		if ($classReflection->hasConstant($constantName)) {
+			return TrinaryLogic::createYes();
+		}
+
+		if ($classReflection->isFinal()) {
+			return TrinaryLogic::createNo();
+		}
+
+		return TrinaryLogic::createMaybe();
+	}
+
+	public function getConstant(string $constantName): ClassConstantReflection
+	{
+		$class = $this->getClassReflection();
+		if ($class === null) {
+			throw new ClassNotFoundException($this->className);
+		}
+
+		return $class->getConstant($constantName);
+	}
+
+	public function getTemplateType(string $ancestorClassName, string $templateTypeName): Type
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return new ErrorType();
+		}
+
+		$ancestorClassReflection = $classReflection->getAncestorWithClassName($ancestorClassName);
+		if ($ancestorClassReflection === null) {
+			return new ErrorType();
+		}
+
+		$activeTemplateTypeMap = $ancestorClassReflection->getPossiblyIncompleteActiveTemplateTypeMap();
+		$type = $activeTemplateTypeMap->getType($templateTypeName);
+		if ($type === null) {
+			return new ErrorType();
+		}
+		if ($type instanceof UnresolvedTemplateArgumentType) {
+			// read out of the object as a derived value - see TemplateTypeHelper::resolveTemplateTypes()
+			return $type->getDelegate();
+		}
+		if ($type instanceof ErrorType) {
+			$templateTypeMap = $ancestorClassReflection->getTemplateTypeMap();
+			$templateType = $templateTypeMap->getType($templateTypeName);
+			if ($templateType === null) {
+				return $type;
+			}
+
+			$bound = TemplateTypeHelper::resolveToBounds($templateType);
+			if ($bound instanceof MixedType && $bound->isExplicitMixed()) {
+				return new MixedType(false);
+			}
+
+			return TemplateTypeHelper::resolveToDefaults($templateType);
+		}
+
+		return $type;
+	}
+
+	public function getConstantStrings(): array
+	{
+		return [];
+	}
+
+	public function isIterable(): TrinaryLogic
+	{
+		return $this->isInstanceOf(Traversable::class);
+	}
+
+	public function isIterableAtLeastOnce(): TrinaryLogic
+	{
+		return $this->isInstanceOf(Traversable::class)
+			->and(TrinaryLogic::createMaybe());
+	}
+
+	public function getArraySize(): Type
+	{
+		if ($this->isInstanceOf(Countable::class)->no()) {
+			return new ErrorType();
+		}
+
+		if ($this->hasMethod('count')->yes() === false) {
+			return IntegerRangeType::fromInterval(0, null);
+		}
+
+		return RecursionGuard::run($this, fn (): Type => $this->getMethod('count', new OutOfClassScope())->getOnlyVariant()->getReturnType());
+	}
+
+	public function getIterableKeyType(): Type
+	{
+		$isTraversable = false;
+		if ($this->isInstanceOf(IteratorAggregate::class)->yes()) {
+			$keyType = RecursionGuard::run($this, fn (): Type => $this->getMethod('getIterator', new OutOfClassScope())->getOnlyVariant()->getReturnType()->getIterableKeyType());
+			$isTraversable = true;
+			if (!$keyType instanceof MixedType || $keyType->isExplicitMixed()) {
+				return $keyType;
+			}
+		}
+
+		$extraOffsetAccessible = $this->isExtraOffsetAccessibleClass()->yes();
+		if (!$extraOffsetAccessible && $this->isInstanceOf(Traversable::class)->yes()) {
+			$isTraversable = true;
+			$tKey = $this->getTemplateType(Traversable::class, 'TKey');
+			if (!$tKey instanceof ErrorType) {
+				if (!$tKey instanceof MixedType || $tKey->isExplicitMixed()) {
+					return $tKey;
+				}
+			}
+		}
+
+		if ($this->isInstanceOf(Iterator::class)->yes()) {
+			return RecursionGuard::run($this, fn (): Type => $this->getMethod('key', new OutOfClassScope())->getOnlyVariant()->getReturnType());
+		}
+
+		if ($extraOffsetAccessible) {
+			return new MixedType(true);
+		}
+
+		if ($isTraversable) {
+			return new MixedType();
+		}
+
+		return new ErrorType();
+	}
+
+	public function getFirstIterableKeyType(): Type
+	{
+		return $this->getIterableKeyType();
+	}
+
+	public function getLastIterableKeyType(): Type
+	{
+		return $this->getIterableKeyType();
+	}
+
+	public function getIterableValueType(): Type
+	{
+		$isTraversable = false;
+		if ($this->isInstanceOf(IteratorAggregate::class)->yes()) {
+			$valueType = RecursionGuard::run($this, fn (): Type => $this->getMethod('getIterator', new OutOfClassScope())->getOnlyVariant()->getReturnType()->getIterableValueType());
+			$isTraversable = true;
+			if (!$valueType instanceof MixedType || $valueType->isExplicitMixed()) {
+				return $valueType;
+			}
+		}
+
+		$extraOffsetAccessible = $this->isExtraOffsetAccessibleClass()->yes();
+		if (!$extraOffsetAccessible && $this->isInstanceOf(Traversable::class)->yes()) {
+			$isTraversable = true;
+			$tValue = $this->getTemplateType(Traversable::class, 'TValue');
+			if (!$tValue instanceof ErrorType) {
+				if (!$tValue instanceof MixedType || $tValue->isExplicitMixed()) {
+					return $tValue;
+				}
+			}
+		}
+
+		if ($this->isInstanceOf(Iterator::class)->yes()) {
+			return RecursionGuard::run($this, fn (): Type => $this->getMethod('current', new OutOfClassScope())->getOnlyVariant()->getReturnType());
+		}
+
+		if ($extraOffsetAccessible) {
+			return new MixedType(true);
+		}
+
+		if ($isTraversable) {
+			return new MixedType();
+		}
+
+		return new ErrorType();
+	}
+
+	public function getFirstIterableValueType(): Type
+	{
+		return $this->getIterableValueType();
+	}
+
+	public function getLastIterableValueType(): Type
+	{
+		return $this->getIterableValueType();
+	}
+
+	public function isNull(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isConstantValue(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isConstantScalarValue(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function getConstantScalarTypes(): array
+	{
+		return [];
+	}
+
+	public function getConstantScalarValues(): array
+	{
+		return [];
+	}
+
+	public function isTrue(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isFalse(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isBoolean(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isFloat(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isInteger(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isNumericString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isDecimalIntegerString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isNonEmptyString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isNonFalsyString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isLiteralString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isLowercaseString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isClassString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isUppercaseString(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function getClassStringObjectType(): Type
+	{
+		return new ErrorType();
+	}
+
+	public function getObjectTypeOrClassStringObjectType(): Type
+	{
+		return $this;
+	}
+
+	public function isVoid(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function isScalar(): TrinaryLogic
+	{
+		return TrinaryLogic::createNo();
+	}
+
+	public function looseCompare(Type $type, PhpVersion $phpVersion): BooleanType
+	{
+		if ($type->isTrue()->yes()) {
+			return new ConstantBooleanType(true);
+		}
+
+		return $type->isFalse()->yes()
+			? new ConstantBooleanType(false)
+			: new BooleanType();
+	}
+
+	private function isExtraOffsetAccessibleClass(): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		foreach (self::EXTRA_OFFSET_CLASSES as $extraOffsetClass) {
+			if ($classReflection->is($extraOffsetClass)) {
+				return TrinaryLogic::createYes();
+			}
+		}
+
+		if ($classReflection->isInterface()) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		if ($classReflection->isFinal()) {
+			return TrinaryLogic::createNo();
+		}
+
+		return TrinaryLogic::createMaybe();
+	}
+
+	public function isOffsetAccessible(): TrinaryLogic
+	{
+		return $this->isInstanceOf(ArrayAccess::class)->or(
+			$this->isExtraOffsetAccessibleClass(),
+		);
+	}
+
+	public function isOffsetAccessLegal(): TrinaryLogic
+	{
+		return $this->isOffsetAccessible();
+	}
+
+	public function hasOffsetValueType(Type $offsetType): TrinaryLogic
+	{
+		if ($this->isInstanceOf(ArrayAccess::class)->yes()) {
+			$acceptedOffsetType = RecursionGuard::run($this, function (): Type {
+				$parameters = $this->getMethod('offsetSet', new OutOfClassScope())->getOnlyVariant()->getParameters();
+				if (count($parameters) < 2) {
+					throw new ShouldNotHappenException(sprintf(
+						'Method %s::%s() has less than 2 parameters.',
+						$this->className,
+						'offsetSet',
+					));
+				}
+
+				$offsetParameter = $parameters[0];
+
+				return $offsetParameter->getType();
+			});
+
+			if ($acceptedOffsetType->isSuperTypeOf($offsetType)->no()) {
+				return TrinaryLogic::createNo();
+			}
+
+			return TrinaryLogic::createMaybe();
+		}
+
+		return $this->isExtraOffsetAccessibleClass()
+			->and(TrinaryLogic::createMaybe());
+	}
+
+	public function getOffsetValueType(Type $offsetType): Type
+	{
+		if ($this->isInstanceOf(ArrayAccess::class)->yes()) {
+			return RecursionGuard::run($this, fn (): Type => $this->getMethod('offsetGet', new OutOfClassScope())->getOnlyVariant()->getReturnType());
+		}
+
+		if (!$this->isExtraOffsetAccessibleClass()->no()) {
+			return new MixedType();
+		}
+
+		return new ErrorType();
+	}
+
+	public function setOffsetValueType(?Type $offsetType, Type $valueType, bool $unionValues = true): Type
+	{
+		if ($this->isOffsetAccessible()->no()) {
+			return new ErrorType();
+		}
+
+		if ($this->isInstanceOf(ArrayAccess::class)->yes()) {
+			$acceptedValueType = new NeverType();
+			$acceptedOffsetType = RecursionGuard::run($this, function () use (&$acceptedValueType): Type {
+				$parameters = $this->getMethod('offsetSet', new OutOfClassScope())->getOnlyVariant()->getParameters();
+				if (count($parameters) < 2) {
+					throw new ShouldNotHappenException(sprintf(
+						'Method %s::%s() has less than 2 parameters.',
+						$this->className,
+						'offsetSet',
+					));
+				}
+
+				$offsetParameter = $parameters[0];
+				$acceptedValueType = $parameters[1]->getType();
+
+				return $offsetParameter->getType();
+			});
+
+			if ($offsetType === null) {
+				$offsetType = new NullType();
+			}
+
+			if (
+				(!$offsetType instanceof MixedType && !$acceptedOffsetType->isSuperTypeOf($offsetType)->yes())
+				|| (!$valueType instanceof MixedType && !$acceptedValueType->isSuperTypeOf($valueType)->yes())
+			) {
+				return new ErrorType();
+			}
+		}
+
+		// in the future we may return intersection of $this and OffsetAccessibleType()
+		return $this;
+	}
+
+	public function setExistingOffsetValueType(Type $offsetType, Type $valueType): Type
+	{
+		if ($this->isOffsetAccessible()->no()) {
+			return new ErrorType();
+		}
+
+		return $this;
+	}
+
+	public function unsetOffset(Type $offsetType): Type
+	{
+		if ($this->isOffsetAccessible()->no()) {
+			return new ErrorType();
+		}
+
+		return $this;
+	}
+
+	public function getEnumCases(): array
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return [];
+		}
+
+		if (!$classReflection->isEnum()) {
+			return [];
+		}
+
+		$cacheKey = $this->describeCache();
+		self::touchDescriptionCacheKey($cacheKey);
+		if (array_key_exists($cacheKey, self::$enumCases)) {
+			return self::$enumCases[$cacheKey];
+		}
+
+		$className = $classReflection->getName();
+
+		if ($this->subtractedType !== null) {
+			$subtractedEnumCaseNames = [];
+
+			foreach ($this->subtractedType->getEnumCases() as $subtractedCase) {
+				$subtractedEnumCaseNames[$subtractedCase->getEnumCaseName()] = true;
+			}
+
+			$cases = [];
+			foreach ($classReflection->getEnumCases() as $enumCase) {
+				if (array_key_exists($enumCase->getName(), $subtractedEnumCaseNames)) {
+					continue;
+				}
+				$cases[] = new EnumCaseObjectType($className, $enumCase->getName(), $classReflection);
+			}
+		} else {
+			$cases = [];
+			foreach ($classReflection->getEnumCases() as $enumCase) {
+				$cases[] = new EnumCaseObjectType($className, $enumCase->getName(), $classReflection);
+			}
+		}
+
+		return self::$enumCases[$cacheKey] = $cases;
+	}
+
+	public function getEnumCaseObject(): ?EnumCaseObjectType
+	{
+		$cases = $this->getEnumCases();
+
+		if (count($cases) === 1) {
+			return $cases[0];
+		}
+
+		return null;
+	}
+
+	public function isCallable(): TrinaryLogic
+	{
+		$parametersAcceptors = RecursionGuard::run($this, fn () => $this->findCallableParametersAcceptors());
+		if ($parametersAcceptors === null) {
+			return TrinaryLogic::createNo();
+		}
+		if ($parametersAcceptors instanceof ErrorType) {
+			return TrinaryLogic::createNo();
+		}
+
+		if (
+			count($parametersAcceptors) === 1
+			&& $parametersAcceptors[0] instanceof TrivialParametersAcceptor
+		) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		return TrinaryLogic::createYes();
+	}
+
+	public function getCallableParametersAcceptors(ClassMemberAccessAnswerer $scope): array
+	{
+		if ($this->className === Closure::class) {
+			return [new TrivialParametersAcceptor('Closure')];
+		}
+		$parametersAcceptors = $this->findCallableParametersAcceptors();
+		if ($parametersAcceptors === null) {
+			throw new ShouldNotHappenException();
+		}
+
+		return $parametersAcceptors;
+	}
+
+	/**
+	 * @return list<CallableParametersAcceptor>|null
+	 */
+	private function findCallableParametersAcceptors(): ?array
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return [new TrivialParametersAcceptor()];
+		}
+
+		if ($classReflection->hasNativeMethod('__invoke')) {
+			$method = $this->getMethod('__invoke', new OutOfClassScope());
+			return FunctionCallableVariant::createFromVariants(
+				$method,
+				$method->getVariants(),
+			);
+		}
+
+		if (!$classReflection->isFinalByKeyword()) {
+			return [new TrivialParametersAcceptor()];
+		}
+
+		return null;
+	}
+
+	public function isCloneable(): TrinaryLogic
+	{
+		return TrinaryLogic::createYes();
+	}
+
+	public function isInstanceOf(string $className): TrinaryLogic
+	{
+		$classReflection = $this->getClassReflection();
+		if ($classReflection === null) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		if ($classReflection->is($className)) {
+			return TrinaryLogic::createYes();
+		}
+
+		$reflectionProvider = ReflectionProviderStaticAccessor::getInstance();
+		if ($reflectionProvider->hasClass($className)) {
+			$thatClassReflection = $reflectionProvider->getClass($className);
+			if ($thatClassReflection->isFinal()) {
+				return TrinaryLogic::createNo();
+			}
+		}
+
+		if ($classReflection->isInterface()) {
+			return TrinaryLogic::createMaybe();
+		}
+
+		return TrinaryLogic::createNo();
+	}
+
+	public function subtract(Type $type): Type
+	{
+		if ($this->subtractedType === null) {
+			return $this->changeSubtractedType($type);
+		}
+
+		// A sealed hierarchy rebuilds its subtraction from the flattened parts
+		// below, so normalising the union of the old and the new subtracted type
+		// first is wasted work - and quadratic when a removal peels the subtypes
+		// off one at a time, as removing a whole enum from its own type does.
+		// Only the path that keeps the subtracted type as it is needs the union.
+		$matched = $this->matchAllowedSubTypes(array_merge(
+			TypeUtils::flattenTypes($this->subtractedType),
+			TypeUtils::flattenTypes($type),
+		));
+		if ($matched !== null) {
+			return $matched;
+		}
+
+		return $this->changeSubtractedType(TypeCombinator::union($this->subtractedType, $type));
+	}
+
+	public function getTypeWithoutSubtractedType(): Type
+	{
+		return $this->changeSubtractedType(null);
+	}
+
+	/**
+	 * Drops the "this is exactly this class" flavour that ClassReflection::asFinal()
+	 * puts on the type of a `new Foo()` expression.
+	 */
+	public function withoutFinalByKeywordOverride(): Type
+	{
+		if ($this->classReflection === null || !$this->classReflection->hasFinalByKeywordOverride()) {
+			return $this;
+		}
+
+		return new self(
+			$this->className,
+			$this->subtractedType,
+			$this->classReflection->withoutFinalByKeywordOverride(),
+		);
+	}
+
+	public function changeSubtractedType(?Type $subtractedType): Type
+	{
+		if ($subtractedType !== null) {
+			$matched = $this->matchAllowedSubTypes(TypeUtils::flattenTypes($subtractedType));
+			if ($matched !== null) {
+				return $matched;
+			}
+		}
+
+		if ($this->subtractedType === null && $subtractedType === null) {
+			return $this;
+		}
+
+		return new self($this->className, $subtractedType);
+	}
+
+	/**
+	 * Rebuilds the type from the subtracted members of its sealed hierarchy.
+	 *
+	 * Returns null when the class has no allowed subtypes, or when a subtracted
+	 * type is not one of them - the caller then keeps the subtracted type whole.
+	 *
+	 * @param array<Type> $subtractedTypes flattened, may repeat
+	 */
+	private function matchAllowedSubTypes(array $subtractedTypes): ?Type
+	{
+		$classReflection = $this->getClassReflection();
+		$allowedSubTypes = $classReflection !== null ? $classReflection->getAllowedSubTypes() : null;
+		if ($allowedSubTypes === null) {
+			return null;
+		}
+
+		$allowedSubTypesCount = count($allowedSubTypes);
+		$subtractedSubTypes = [];
+
+		// Enum cases are finite values: FiniteTypeSet keys them by value identity, so
+		// a subtracted case is a lookup instead of an equals() sweep over every
+		// allowed case - quadratic in the enum size. Allowed subtypes it cannot key
+		// (a sealed class hierarchy) still take the sweep.
+		$allowedSet = FiniteTypeSet::create(array_values($allowedSubTypes));
+		$keyedAllowedSubTypes = $allowedSet !== null ? $allowedSet->getMembers() : [];
+		$otherAllowedSubTypes = $allowedSet !== null ? $allowedSet->getOthers() : array_values($allowedSubTypes);
+
+		foreach ($subtractedTypes as $subType) {
+			$key = FiniteTypeSet::key($subType);
+			if ($key !== null) {
+				if (!array_key_exists($key, $keyedAllowedSubTypes) || !$subType->equals($keyedAllowedSubTypes[$key])) {
+					return null;
+				}
+
+				$subtractedSubTypes[] = $subType;
+				unset($keyedAllowedSubTypes[$key]);
+				continue;
+			}
+
+			foreach ($otherAllowedSubTypes as $i => $allowedSubType) {
+				if ($subType->equals($allowedSubType)) {
+					// An allowed subtype is dropped as it matches, so no two matches
+					// can be the same one and the matches need no keying.
+					$subtractedSubTypes[] = $subType;
+					unset($otherAllowedSubTypes[$i]);
+					continue 2;
+				}
+			}
+
+			return null;
+		}
+
+		$remainingAllowedSubTypes = array_merge(array_values($keyedAllowedSubTypes), array_values($otherAllowedSubTypes));
+		if (count($remainingAllowedSubTypes) === 1) {
+			return $remainingAllowedSubTypes[0];
+		}
+
+		$subtractedSubTypesCount = count($subtractedSubTypes);
+		if ($subtractedSubTypesCount === $allowedSubTypesCount) {
+			return new NeverType();
+		}
+
+		if ($subtractedSubTypesCount === 0) {
+			return new self($this->className);
+		}
+
+		if ($subtractedSubTypesCount === 1) {
+			return new self($this->className, $subtractedSubTypes[0]);
+		}
+
+		return new self($this->className, new UnionType($subtractedSubTypes));
+	}
+
+	public function getSubtractedType(): ?Type
+	{
+		return $this->subtractedType;
+	}
+
+	public function traverse(callable $cb): Type
+	{
+		$subtractedType = $this->subtractedType !== null ? $cb($this->subtractedType) : null;
+
+		if ($subtractedType !== $this->subtractedType) {
+			return new self(
+				$this->className,
+				$subtractedType,
+			);
+		}
+
+		return $this;
+	}
+
+	public function traverseSimultaneously(Type $right, callable $cb): Type
+	{
+		if ($this->subtractedType === null) {
+			return $this;
+		}
+
+		return new self($this->className);
+	}
+
+	public function getNakedClassReflection(): ?ClassReflection
+	{
+		$classReflection = $this->resolvedClassReflection();
+		if ($classReflection !== null) {
+			return $classReflection;
+		}
+
+		$reflectionProvider = ReflectionProviderStaticAccessor::getInstance();
+		if (!$reflectionProvider->hasClass($this->className)) {
+			return null;
+		}
+
+		return $reflectionProvider->getClass($this->className);
+	}
+
+	public function getClassReflection(): ?ClassReflection
+	{
+		$classReflection = $this->resolvedClassReflection();
+		if ($classReflection === null) {
+			$reflectionProvider = ReflectionProviderStaticAccessor::getInstance();
+			if (!$reflectionProvider->hasClass($this->className)) {
+				return null;
+			}
+
+			$classReflection = $this->lazyClassReflection = $reflectionProvider->getClass($this->className);
+		}
+
+		if ($classReflection->isGeneric()) {
+			return $classReflection->withTypes(array_values($classReflection->getTemplateTypeMap()->map(static fn (): Type => new ErrorType())->getTypes()));
+		}
+
+		return $classReflection;
+	}
+
+	/** The reflection already known, from either source — never triggers a fetch. */
+	private function resolvedClassReflection(): ?ClassReflection
+	{
+		return $this->classReflection ?? $this->lazyClassReflection;
+	}
+
+	public function getAncestorWithClassName(string $className): ?self
+	{
+		if ($this->className === $className) {
+			return $this;
+		}
+
+		$resolvedClassReflection = $this->resolvedClassReflection();
+		if ($resolvedClassReflection !== null && $className === $resolvedClassReflection->getName()) {
+			return $this;
+		}
+
+		if (array_key_exists($className, $this->currentAncestors)) {
+			return $this->currentAncestors[$className];
+		}
+
+		$description = $this->describeCache();
+		self::touchDescriptionCacheKey($description);
+		if (
+			array_key_exists($description, self::$ancestors)
+			&& array_key_exists($className, self::$ancestors[$description])
+		) {
+			return self::$ancestors[$description][$className];
+		}
+
+		$reflectionProvider = ReflectionProviderStaticAccessor::getInstance();
+		if (!$reflectionProvider->hasClass($className)) {
+			return self::$ancestors[$description][$className] = $this->currentAncestors[$className] = null;
+		}
+		$theirReflection = $reflectionProvider->getClass($className);
+
+		$thisReflection = $this->getClassReflection();
+		if ($thisReflection === null) {
+			return self::$ancestors[$description][$className] = $this->currentAncestors[$className] = null;
+		}
+		if ($theirReflection->getName() === $thisReflection->getName()) {
+			return self::$ancestors[$description][$className] = $this->currentAncestors[$className] = $this;
+		}
+
+		foreach ($this->getInterfaces() as $interface) {
+			$ancestor = $interface->getAncestorWithClassName($className);
+			if ($ancestor !== null) {
+				return self::$ancestors[$description][$className] = $this->currentAncestors[$className] = $ancestor;
+			}
+		}
+
+		$parent = $this->getParent();
+		if ($parent !== null) {
+			$ancestor = $parent->getAncestorWithClassName($className);
+			if ($ancestor !== null) {
+				return self::$ancestors[$description][$className] = $this->currentAncestors[$className] = $ancestor;
+			}
+		}
+
+		return self::$ancestors[$description][$className] = $this->currentAncestors[$className] = null;
+	}
+
+	private function getParent(): ?ObjectType
+	{
+		if ($this->cachedParent !== null) {
+			return $this->cachedParent;
+		}
+		$thisReflection = $this->getClassReflection();
+		if ($thisReflection === null) {
+			return null;
+		}
+
+		$parentReflection = $thisReflection->getParentClass();
+		if ($parentReflection === null) {
+			return null;
+		}
+
+		return $this->cachedParent = $parentReflection->getObjectType();
+	}
+
+	/** @return ObjectType[] */
+	private function getInterfaces(): array
+	{
+		if ($this->cachedInterfaces !== null) {
+			return $this->cachedInterfaces;
+		}
+		$thisReflection = $this->getClassReflection();
+		if ($thisReflection === null) {
+			return $this->cachedInterfaces = [];
+		}
+
+		return $this->cachedInterfaces = array_map(static fn (ClassReflection $interfaceReflection): self => $interfaceReflection->getObjectType(), $thisReflection->getInterfaces());
+	}
+
+	public function tryRemove(Type $typeToRemove): ?Type
+	{
+		if ($typeToRemove instanceof ObjectType) {
+			foreach (UnionType::EQUAL_UNION_CLASSES as $baseClass => $classes) {
+				if ($this->getClassName() !== $baseClass) {
+					continue;
+				}
+
+				foreach ($classes as $index => $class) {
+					if ($typeToRemove->getClassName() === $class) {
+						unset($classes[$index]);
+
+						return TypeCombinator::union(
+							...array_map(static fn (string $objectClass): Type => new ObjectType($objectClass), $classes),
+						);
+					}
+				}
+			}
+		}
+
+		if ($this->isSuperTypeOf($typeToRemove)->yes()) {
+			return $this->subtract($typeToRemove);
+		}
+
+		$classReflection = $this->getClassReflection();
+		if ($typeToRemove instanceof UnionType && $classReflection !== null && $classReflection->getAllowedSubTypes() !== null) {
+			// A sealed hierarchy subtracts by set difference, so the members this
+			// type no longer holds (already subtracted) are no-ops and the rest come
+			// off in one subtraction - the same result as removing them one at a
+			// time, without rebuilding the subtracted union once per member.
+			$membersToRemove = [];
+			foreach ($typeToRemove->getTypes() as $member) {
+				$isSuperTypeOfMember = $this->isSuperTypeOf($member);
+				if ($isSuperTypeOfMember->yes()) {
+					$membersToRemove[] = $member;
+					continue;
+				}
+				if ($isSuperTypeOfMember->maybe()) {
+					return null;
+				}
+			}
+
+			if ($membersToRemove === []) {
+				return $this;
+			}
+
+			return $this->subtract(count($membersToRemove) === 1 ? $membersToRemove[0] : new UnionType($membersToRemove));
+		}
+
+		return null;
+	}
+
+	public function getFiniteTypes(): array
+	{
+		return $this->getEnumCases();
+	}
+
+	public function exponentiate(Type $exponent): Type
+	{
+		$object = new ObjectWithoutClassType();
+		if (!$exponent instanceof NeverType && !$object->isSuperTypeOf($this)->no() && !$object->isSuperTypeOf($exponent)->no()) {
+			return TypeCombinator::union($this, $exponent);
+		}
+		return new ErrorType();
+	}
+
+	public function toPhpDocNode(): TypeNode
+	{
+		return new FullyQualifiedNameNode($this->getClassName());
+	}
+
+	public function toNativePhpTypeNode(NativeTypePosition $position)
+	{
+		$className = $this->getClassName();
+		if ($className === '' || !$position->isClassNameAllowed()) {
+			return null;
+		}
+
+		return new FullyQualified($className);
+	}
+
+	public function hasTemplateOrLateResolvableType(): bool
+	{
+		if ($this->subtractedType === null) {
+			return false;
+		}
+
+		return $this->subtractedType->hasTemplateOrLateResolvableType();
+	}
+
+}

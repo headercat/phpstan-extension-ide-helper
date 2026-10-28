@@ -1,0 +1,334 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PhpParser\Node;
+use PHPStan\AnalysedCodeException;
+use PHPStan\BetterReflection\NodeCompiler\Exception\UnableToCompileNode;
+use PHPStan\BetterReflection\Reflection\Exception\CircularReference;
+use PHPStan\BetterReflection\Reflector\Exception\IdentifierNotFound;
+use PHPStan\Collectors\CollectedData;
+use PHPStan\Collectors\Collector;
+use PHPStan\Collectors\Registry as CollectorRegistry;
+use PHPStan\Dependency\DependencyResolver;
+use PHPStan\Dependency\RootExportedNode;
+use PHPStan\Node\EmitCollectedDataNode;
+use PHPStan\Node\InTraitNode;
+use PHPStan\Parser\Parser;
+use PHPStan\Rules\FileDependenciesRuleError;
+use PHPStan\Rules\Registry as RuleRegistry;
+use PHPStan\Rules\Rule;
+use function array_keys;
+use function get_class;
+use function sprintf;
+
+/**
+ * @phpstan-import-type CollectorData from CollectedData
+ * @phpstan-import-type Identifier from FileAnalyserResult
+ * @phpstan-import-type LinesToIgnore from FileAnalyserResult
+ */
+final class FileAnalyserCallback
+{
+
+	/** @var list<Error> */
+	private array $fileErrors = [];
+
+	/** @var CollectorData */
+	private array $fileCollectedData = [];
+
+	/** @var list<RootExportedNode> */
+	private array $exportedNodes = [];
+
+	/** @var list<Error> */
+	private array $temporaryFileErrors = [];
+
+	/** @var LinesToIgnore */
+	private array $linesToIgnore;
+
+	/** @var LinesToIgnore */
+	private array $unmatchedLineIgnores;
+
+	/**
+	 * The registries answer per node class and cache that themselves; this keeps the answer for the
+	 * classes met in this file, so that the walk does not ask them again for every node of a class.
+	 *
+	 * @var array<string, array<Rule<Node>>>
+	 */
+	private array $rulesByNodeType = [];
+
+	/** @var array<string, array<Collector<Node, mixed>>> */
+	private array $collectorsByNodeType = [];
+
+	/**
+	 * Whether a node of the class can be exported or change the PHPDoc name scope - most cannot, and
+	 * the walk does not ask DependencyResolver about them at all.
+	 *
+	 * @var array<string, bool>
+	 */
+	private array $exportableByNodeType = [];
+
+	/**
+	 * @param callable(Node $node, Scope $scope): void|null $outerNodeCallback
+	 * @param Node\Stmt[] $parserNodes
+	 * @param IgnoreErrorExtension[] $ignoreErrorExtensions
+	 * @param list<string> $processedFiles
+	 */
+	public function __construct(
+		private string $file,
+		private RuleRegistry $ruleRegistry,
+		private CollectorRegistry $collectorRegistry,
+		private $outerNodeCallback,
+		private array $parserNodes,
+		private array $ignoreErrorExtensions,
+		private Parser $parser,
+		private RuleErrorTransformer $ruleErrorTransformer,
+		private array $processedFiles,
+		private DependencyResolver $dependencyResolver,
+	)
+	{
+		$this->linesToIgnore = $this->unmatchedLineIgnores = [$file => $this->getLinesToIgnoreFromTokens($parserNodes)];
+	}
+
+	public function __invoke(Node $node, Scope $scope): void
+	{
+		// read before the instanceof checks below narrow $node: the registries are generic over the
+		// node class, and a narrowed class-string makes what they answer a different Rule<T>
+		$nodeType = get_class($node);
+		if ($node instanceof EmitCollectedDataNode) {
+			$this->fileCollectedData[$scope->getFile()][$node->getCollectorType()][] = $node->getData();
+			return;
+		}
+
+		$parserNodes = $this->parserNodes;
+
+		/** @var Scope&NodeCallbackInvoker&CollectedDataEmitter&DependencyTracker $scope */
+		if ($node instanceof Node\Stmt\Trait_) {
+			foreach (array_keys($this->linesToIgnore[$this->file] ?? []) as $lineToIgnore) {
+				if ($lineToIgnore < $node->getStartLine() || $lineToIgnore > $node->getEndLine()) {
+					continue;
+				}
+
+				unset($this->unmatchedLineIgnores[$this->file][$lineToIgnore]);
+			}
+		}
+		if ($node instanceof InTraitNode) {
+			$traitNode = $node->getOriginalNode();
+			$fileDescription = $scope->getFileDescription();
+			$this->linesToIgnore[$fileDescription] ??= [];
+			$this->linesToIgnore[$fileDescription] += $this->getLinesToIgnoreFromTokens([$traitNode]);
+
+			$traitFileName = $node->getTraitReflection()->getFileName();
+			if ($traitFileName !== null) {
+				$this->processedFiles[] = $traitFileName;
+			}
+		}
+
+		if ($scope->isInTrait()) {
+			$traitReflection = $scope->getTraitReflection();
+			if ($traitReflection->getFileName() !== null) {
+				$traitFilePath = $traitReflection->getFileName();
+				$parserNodes = $this->parser->parseFile($traitFilePath);
+			}
+		}
+
+		if ($this->outerNodeCallback !== null) {
+			($this->outerNodeCallback)($node, $scope);
+		}
+		$uniquedAnalysedCodeExceptionMessages = [];
+		$rules = $this->rulesByNodeType[$nodeType] ?? null;
+		if ($rules === null) {
+			$rules = $this->ruleRegistry->getRules($nodeType);
+			$this->rulesByNodeType[$nodeType] = $rules;
+		}
+		foreach ($rules as $rule) {
+			try {
+				$ruleErrors = $rule->processNode($node, $scope);
+			} catch (AnalysedCodeException $e) {
+				if (isset($uniquedAnalysedCodeExceptionMessages[$e->getMessage()])) {
+					continue;
+				}
+
+				$uniquedAnalysedCodeExceptionMessages[$e->getMessage()] = true;
+				$this->fileErrors[] = (new Error($e->getMessage(), $this->file, $node->getStartLine(), $e, tip: $e->getTip()))
+					->withIdentifier('phpstan.internal')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+				continue;
+			} catch (IdentifierNotFound $e) {
+				$this->fileErrors[] = (new Error(sprintf('Reflection error: %s not found.', $e->getIdentifier()->getName()), $this->file, $node->getStartLine(), $e, tip: 'Learn more at https://phpstan.org/user-guide/discovering-symbols'))
+					->withIdentifier('phpstan.reflection')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+				continue;
+			} catch (UnableToCompileNode | CircularReference $e) {
+				$this->fileErrors[] = (new Error(sprintf('Reflection error: %s', $e->getMessage()), $this->file, $node->getStartLine(), $e))
+					->withIdentifier('phpstan.reflection')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+				continue;
+			}
+
+			foreach ($ruleErrors as $ruleError) {
+				if ($ruleError instanceof FileDependenciesRuleError) {
+					// the deprecated way of DependencyTracker::trackFileDependency()
+					foreach ($ruleError->getFileDependencies() as $fileDependency) {
+						$scope->trackFileDependency($fileDependency);
+					}
+				}
+
+				$error = $this->ruleErrorTransformer->transform($ruleError, $scope, $parserNodes, $node);
+
+				if ($error->canBeIgnored()) {
+					foreach ($this->ignoreErrorExtensions as $ignoreErrorExtension) {
+						if ($ignoreErrorExtension->shouldIgnore($error, $node, $scope)) {
+							continue 2;
+						}
+					}
+				}
+
+				$this->temporaryFileErrors[] = $error;
+			}
+		}
+
+		$collectors = $this->collectorsByNodeType[$nodeType] ?? null;
+		if ($collectors === null) {
+			$collectors = $this->collectorRegistry->getCollectors($nodeType);
+			$this->collectorsByNodeType[$nodeType] = $collectors;
+		}
+		foreach ($collectors as $collector) {
+			try {
+				$collectedData = $collector->processNode($node, $scope);
+			} catch (AnalysedCodeException $e) {
+				if (isset($uniquedAnalysedCodeExceptionMessages[$e->getMessage()])) {
+					continue;
+				}
+
+				$uniquedAnalysedCodeExceptionMessages[$e->getMessage()] = true;
+				$this->fileErrors[] = (new Error($e->getMessage(), $this->file, $node->getStartLine(), $e, tip: $e->getTip()))
+					->withIdentifier('phpstan.internal')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+				continue;
+			} catch (IdentifierNotFound $e) {
+				$this->fileErrors[] = (new Error(sprintf('Reflection error: %s not found.', $e->getIdentifier()->getName()), $this->file, $node->getStartLine(), $e, tip: 'Learn more at https://phpstan.org/user-guide/discovering-symbols'))
+					->withIdentifier('phpstan.reflection')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+				continue;
+			} catch (UnableToCompileNode | CircularReference $e) {
+				$this->fileErrors[] = (new Error(sprintf('Reflection error: %s', $e->getMessage()), $this->file, $node->getStartLine(), $e))
+					->withIdentifier('phpstan.reflection')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+				continue;
+			}
+
+			if ($collectedData === null) {
+				continue;
+			}
+
+			$this->fileCollectedData[$scope->getFile()][get_class($collector)][] = $collectedData;
+		}
+
+		if (!($this->exportableByNodeType[$nodeType] ??= $this->dependencyResolver->canExportNode($node))) {
+			return;
+		}
+
+		try {
+			$exportedNode = $this->dependencyResolver->resolveExportedNode($node, $scope);
+			if ($exportedNode !== null) {
+				$this->exportedNodes[] = $exportedNode;
+			}
+		} catch (AnalysedCodeException) {
+			// pass
+		} catch (IdentifierNotFound) {
+			// pass
+		} catch (UnableToCompileNode) {
+			// pass
+		}
+	}
+
+	/**
+	 * @param Node[] $nodes
+	 * @return array<int, non-empty-list<Identifier>|null>
+	 */
+	private function getLinesToIgnoreFromTokens(array $nodes): array
+	{
+		if (!isset($nodes[0])) {
+			return [];
+		}
+
+		/** @var array<int, non-empty-list<Identifier>|null> */
+		return $nodes[0]->getAttribute('linesToIgnore', []);
+	}
+
+	/**
+	 * @return list<Error>
+	 */
+	public function getFileErrors(): array
+	{
+		return $this->fileErrors;
+	}
+
+	/**
+	 * @return CollectorData
+	 */
+	public function getFileCollectedData(): array
+	{
+		return $this->fileCollectedData;
+	}
+
+	/**
+	 * @return list<RootExportedNode>
+	 */
+	public function getExportedNodes(): array
+	{
+		return $this->exportedNodes;
+	}
+
+	/**
+	 * @return LinesToIgnore
+	 */
+	public function getLinesToIgnore(): array
+	{
+		return $this->linesToIgnore;
+	}
+
+	/**
+	 * @return LinesToIgnore
+	 */
+	public function getUnmatchedLineIgnores(): array
+	{
+		return $this->unmatchedLineIgnores;
+	}
+
+	/**
+	 * @return list<Error>
+	 */
+	public function getTemporaryFileErrors(): array
+	{
+		return $this->temporaryFileErrors;
+	}
+
+	/**
+	 * @return list<string>
+	 */
+	public function getProcessedFiles(): array
+	{
+		return $this->processedFiles;
+	}
+
+}
