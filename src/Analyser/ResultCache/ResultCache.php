@@ -1,0 +1,211 @@
+<?php 
+
+namespace PHPStan\Analyser\ResultCache;
+return;
+
+use PHPStan\Analyser\CollectedDataRuleResult;
+use PHPStan\Analyser\Error;
+use PHPStan\Analyser\FileAnalyserResult;
+use PHPStan\Dependency\RootExportedNode;
+
+/**
+ * @phpstan-import-type LinesToIgnore from FileAnalyserResult
+ */
+final class ResultCache
+{
+
+	/**
+	 * @param string[] $filesToAnalyse
+	 * @param mixed[] $meta
+	 * @param array<string, list<Error>> $errors
+	 * @param array<string, list<Error>> $locallyIgnoredErrors
+	 * @param array<string, LinesToIgnore> $linesToIgnore
+	 * @param array<string, LinesToIgnore> $unmatchedLineIgnores
+	 * @param array<string, array<string>> $dependencies
+	 * @param array<string, array<string>> $usedTraitDependencies
+	 * @param array<string, array{string, string, string, list<string>, list<string>}> $valueDependencies id => [extension class, key, current value, analysis dependents, declarations dependents] - see ValueDependencyCollector
+	 * @param array<string, array<string>> $packageDependencies
+	 * @param array<string, array<RootExportedNode>> $exportedNodes the decoded ones - see $cachedExportedNodes for the rest
+	 * @param array<string, array{string, bool, string}> $projectExtensionFiles
+	 * @param array<string, string> $currentFileHashes
+	 * @param array<string, CollectedDataRuleResult> $collectedDataRuleResults
+	 * @param list<string> $filesWithCollectedDataRuleErrors the files with errors of the rules on CollectedDataNode
+	 */
+	public function __construct(
+		private array $filesToAnalyse,
+		private bool $fullAnalysis,
+		private ?string $fullAnalysisReason,
+		private int $lastFullAnalysisTime,
+		private array $meta,
+		private array $errors,
+		private array $locallyIgnoredErrors,
+		private array $linesToIgnore,
+		private array $unmatchedLineIgnores,
+		private LazyCollectedData $collectedData,
+		private array $dependencies,
+		private array $usedTraitDependencies,
+		private array $valueDependencies,
+		private array $packageDependencies,
+		private array $exportedNodes,
+		private CachedExportedNodes $cachedExportedNodes,
+		private array $projectExtensionFiles,
+		private array $currentFileHashes,
+		private array $collectedDataRuleResults = [],
+		private array $filesWithCollectedDataRuleErrors = [],
+	)
+	{
+	}
+
+	/**
+	 * @return string[]
+	 */
+	public function getFilesToAnalyse(): array
+	{
+		return $this->filesToAnalyse;
+	}
+
+	public function isFullAnalysis(): bool
+	{
+		return $this->fullAnalysis;
+	}
+
+	/**
+	 * Human-readable explanation of why the cached results could not be reused,
+	 * null when the result cache is being used.
+	 */
+	public function getFullAnalysisReason(): ?string
+	{
+		return $this->fullAnalysisReason;
+	}
+
+	public function getLastFullAnalysisTime(): int
+	{
+		return $this->lastFullAnalysisTime;
+	}
+
+	/**
+	 * @return mixed[]
+	 */
+	public function getMeta(): array
+	{
+		return $this->meta;
+	}
+
+	/**
+	 * @return array<string, list<Error>>
+	 */
+	public function getErrors(): array
+	{
+		return $this->errors;
+	}
+
+	/**
+	 * @return array<string, list<Error>>
+	 */
+	public function getLocallyIgnoredErrors(): array
+	{
+		return $this->locallyIgnoredErrors;
+	}
+
+	/**
+	 * @return array<string, LinesToIgnore>
+	 */
+	public function getLinesToIgnore(): array
+	{
+		return $this->linesToIgnore;
+	}
+
+	/**
+	 * @return array<string, LinesToIgnore>
+	 */
+	public function getUnmatchedLineIgnores(): array
+	{
+		return $this->unmatchedLineIgnores;
+	}
+
+	public function getCollectedData(): LazyCollectedData
+	{
+		return $this->collectedData;
+	}
+
+	/**
+	 * @return array<string, array<string>>
+	 */
+	public function getDependencies(): array
+	{
+		return $this->dependencies;
+	}
+
+	/**
+	 * @return array<string, array<string>>
+	 */
+	public function getUsedTraitDependencies(): array
+	{
+		return $this->usedTraitDependencies;
+	}
+
+	/**
+	 * @return array<string, array{string, string, string, list<string>, list<string>}>
+	 */
+	public function getValueDependencies(): array
+	{
+		return $this->valueDependencies;
+	}
+
+	/**
+	 * @return array<string, array<string>>
+	 */
+	public function getPackageDependencies(): array
+	{
+		return $this->packageDependencies;
+	}
+
+	/**
+	 * @return array<string, array<RootExportedNode>>
+	 */
+	public function getExportedNodes(): array
+	{
+		return $this->exportedNodes;
+	}
+
+	/**
+	 * The exported nodes carried over from the cache file undecoded, for the files not in getExportedNodes().
+	 */
+	public function getCachedExportedNodes(): CachedExportedNodes
+	{
+		return $this->cachedExportedNodes;
+	}
+
+	/**
+	 * @return array<string, array{string, bool, string}>
+	 */
+	public function getProjectExtensionFiles(): array
+	{
+		return $this->projectExtensionFiles;
+	}
+
+	/**
+	 * @return array<string, string>
+	 */
+	public function getCurrentFileHashes(): array
+	{
+		return $this->currentFileHashes;
+	}
+
+	/**
+	 * @return array<string, CollectedDataRuleResult>
+	 */
+	public function getCollectedDataRuleResults(): array
+	{
+		return $this->collectedDataRuleResults;
+	}
+
+	/**
+	 * @return list<string>
+	 */
+	public function getFilesWithCollectedDataRuleErrors(): array
+	{
+		return $this->filesWithCollectedDataRuleErrors;
+	}
+
+}

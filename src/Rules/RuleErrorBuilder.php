@@ -1,0 +1,379 @@
+<?php 
+
+namespace PHPStan\Rules;
+return;
+
+use PhpParser\Node;
+use PhpParser\NodeVisitor;
+use PHPStan\Analyser\Error;
+use PHPStan\ShouldNotHappenException;
+use function array_map;
+use function class_exists;
+use function count;
+use function implode;
+use function is_file;
+use function sprintf;
+
+/**
+ * @api
+ * @template-covariant T of RuleError
+ */
+final class RuleErrorBuilder
+{
+
+	private const TYPE_MESSAGE = 1;
+	private const TYPE_LINE = 2;
+	private const TYPE_FILE = 4;
+	private const TYPE_TIP = 8;
+	private const TYPE_IDENTIFIER = 16;
+	private const TYPE_METADATA = 32;
+	private const TYPE_NON_IGNORABLE = 64;
+	private const TYPE_FIXABLE_NODE = 128;
+	private const TYPE_FILE_DEPENDENCIES = 256;
+
+	private int $type;
+
+	/** @var mixed[] */
+	private array $properties;
+
+	/** @var list<string> */
+	private array $tips = [];
+
+	private function __construct(string $message)
+	{
+		$this->properties['message'] = $message;
+		$this->type = self::TYPE_MESSAGE;
+	}
+
+	/**
+	 * @return array<int, array{string, array<array{string, string|null, string}>}>
+	 */
+	public static function getRuleErrorTypes(): array
+	{
+		return [
+			self::TYPE_MESSAGE => [
+				RuleError::class,
+				[
+					[
+						'message', // property name
+						'string', // native type
+						'string', // PHPDoc type
+					],
+				],
+			],
+			self::TYPE_LINE => [
+				LineRuleError::class,
+				[
+					[
+						'line',
+						'int',
+						'int',
+					],
+				],
+			],
+			self::TYPE_FILE => [
+				FileRuleError::class,
+				[
+					[
+						'file',
+						'string',
+						'string',
+					],
+					[
+						'fileDescription',
+						'string',
+						'string',
+					],
+				],
+			],
+			self::TYPE_TIP => [
+				TipRuleError::class,
+				[
+					[
+						'tip',
+						'string',
+						'string',
+					],
+				],
+			],
+			self::TYPE_IDENTIFIER => [
+				IdentifierRuleError::class,
+				[
+					[
+						'identifier',
+						'string',
+						'string',
+					],
+				],
+			],
+			self::TYPE_METADATA => [
+				MetadataRuleError::class,
+				[
+					[
+						'metadata',
+						'array',
+						'mixed[]',
+					],
+				],
+			],
+			self::TYPE_NON_IGNORABLE => [
+				NonIgnorableRuleError::class,
+				[],
+			],
+			self::TYPE_FIXABLE_NODE => [
+				FixableNodeRuleError::class,
+				[
+					[
+						'nodeFixes',
+						'array',
+						'non-empty-list<\PHPStan\Rules\NodeFix>',
+					],
+				],
+			],
+			self::TYPE_FILE_DEPENDENCIES => [
+				FileDependenciesRuleError::class,
+				[
+					[
+						'fileDependencies',
+						'array',
+						'list<string>',
+					],
+				],
+			],
+		];
+	}
+
+	/**
+	 * @return self<RuleError>
+	 */
+	public static function message(string $message): self
+	{
+		return new self($message);
+	}
+
+	/**
+	 * @phpstan-this-out self<T&LineRuleError>
+	 * @return self<T&LineRuleError>
+	 */
+	public function line(int $line): self
+	{
+		$this->properties['line'] = $line;
+		$this->type |= self::TYPE_LINE;
+
+		return $this;
+	}
+
+	/**
+	 * @phpstan-this-out self<T&FileRuleError>
+	 * @return self<T&FileRuleError>
+	 */
+	public function file(string $file, ?string $fileDescription = null): self
+	{
+		if (!is_file($file)) {
+			throw new ShouldNotHappenException(sprintf('File %s does not exist.', $file));
+		}
+		$this->properties['file'] = $file;
+		$this->properties['fileDescription'] = $fileDescription ?? $file;
+		$this->type |= self::TYPE_FILE;
+
+		return $this;
+	}
+
+	/**
+	 * Declares that this error depends on the contents of another file, so that the result cache
+	 * re-analyses the file the error is reported in when that file appears, changes or is deleted.
+	 * The path must be absolute; it does not have to exist.
+	 *
+	 * @deprecated Call trackFileDependency() on the Scope instead (Scope&DependencyTracker) - it declares
+	 *             the dependency whether the rule reports an error or not.
+	 * @api
+	 * @phpstan-this-out self<T&FileDependenciesRuleError>
+	 * @return self<T&FileDependenciesRuleError>
+	 */
+	public function fileDependency(string $file): self
+	{
+		/** @var list<string> $fileDependencies */
+		$fileDependencies = $this->properties['fileDependencies'] ?? [];
+		$fileDependencies[] = $file;
+		$this->properties['fileDependencies'] = $fileDependencies;
+		$this->type |= self::TYPE_FILE_DEPENDENCIES;
+
+		return $this;
+	}
+
+	/**
+	 * @phpstan-this-out self<T&TipRuleError>
+	 * @return self<T&TipRuleError>
+	 */
+	public function tip(string $tip): self
+	{
+		$this->tips = [$tip];
+		$this->type |= self::TYPE_TIP;
+
+		return $this;
+	}
+
+	/**
+	 * @phpstan-this-out self<T&TipRuleError>
+	 * @return self<T&TipRuleError>
+	 */
+	public function addTip(string $tip): self
+	{
+		$this->tips[] = $tip;
+		$this->type |= self::TYPE_TIP;
+
+		return $this;
+	}
+
+	/**
+	 * @phpstan-this-out self<T&TipRuleError>
+	 * @return self<T&TipRuleError>
+	 */
+	public function discoveringSymbolsTip(): self
+	{
+		return $this->tip('Learn more at https://phpstan.org/user-guide/discovering-symbols');
+	}
+
+	/**
+	 * @param list<string> $reasons
+	 * @phpstan-this-out self<T&TipRuleError>
+	 * @return self<T&TipRuleError>
+	 */
+	public function acceptsReasonsTip(array $reasons): self
+	{
+		foreach ($reasons as $reason) {
+			$this->addTip($reason);
+		}
+
+		return $this;
+	}
+
+	/**
+	 * @phpstan-this-out self<T&TipRuleError>
+	 * @return self<T&TipRuleError>
+	 */
+	public function treatPhpDocTypesAsCertainTip(): self
+	{
+		return $this->tip('Because the type is coming from a PHPDoc, you can turn off this check by setting <fg=cyan>treatPhpDocTypesAsCertain: false</> in your <fg=cyan>%configurationFile%</>.');
+	}
+
+	/**
+	 * @param list<string> $callDescriptions
+	 * @phpstan-this-out self<T&TipRuleError>
+	 * @return self<T&TipRuleError>
+	 */
+	public function possiblyImpureTip(array $callDescriptions): self
+	{
+		foreach ($callDescriptions as $callDescription) {
+			$this->addTip(sprintf('If %s is impure, add <fg=cyan>@phpstan-impure</> PHPDoc tag above its declaration. Learn more: <fg=cyan>https://phpstan.org/blog/remembering-and-forgetting-returned-values</>', $callDescription));
+		}
+
+		return $this;
+	}
+
+	/**
+	 * Sets an error identifier.
+	 *
+	 * List of all current error identifiers in PHPStan: https://phpstan.org/error-identifiers
+	 *
+	 * @phpstan-this-out self<T&IdentifierRuleError>
+	 * @return self<T&IdentifierRuleError>
+	 */
+	public function identifier(string $identifier): self
+	{
+		if (!Error::validateIdentifier($identifier)) {
+			throw new ShouldNotHappenException(sprintf('Invalid identifier: %s, error identifiers must match /%s/', $identifier, Error::PATTERN_IDENTIFIER));
+		}
+
+		$this->properties['identifier'] = $identifier;
+		$this->type |= self::TYPE_IDENTIFIER;
+
+		return $this;
+	}
+
+	/**
+	 * @param mixed[] $metadata
+	 * @phpstan-this-out self<T&MetadataRuleError>
+	 * @return self<T&MetadataRuleError>
+	 */
+	public function metadata(array $metadata): self
+	{
+		$this->properties['metadata'] = $metadata;
+		$this->type |= self::TYPE_METADATA;
+
+		return $this;
+	}
+
+	/**
+	 * @phpstan-this-out self<T&NonIgnorableRuleError>
+	 * @return self<T&NonIgnorableRuleError>
+	 */
+	public function nonIgnorable(): self
+	{
+		$this->type |= self::TYPE_NON_IGNORABLE;
+
+		return $this;
+	}
+
+	/**
+	 * Every call adds a change to the fix of the error. The changes are applied together or not at all.
+	 * Several changes of the same node are applied in the order they were added.
+	 *
+	 * @template TNode of Node
+	 * @param TNode $node
+	 * @param callable(TNode): (Node|NodeVisitor::REMOVE_NODE) $cb returning NodeVisitor::REMOVE_NODE works like removeNode()
+	 * @param string|null $file the file of the node when it is not the file of the error
+	 * @phpstan-this-out self<T&FixableNodeRuleError>
+	 * @return self<T&FixableNodeRuleError>
+	 */
+	public function fixNode(Node $node, callable $cb, ?string $file = null): self
+	{
+		// ReplacingNodeVisitor passes the callback only a clone of $node
+		/** @var callable(Node): (Node|NodeVisitor::REMOVE_NODE) $cb */
+		$this->properties['nodeFixes'][] = new NodeFix($node, $cb, $file);
+		$this->type |= self::TYPE_FIXABLE_NODE;
+
+		return $this;
+	}
+
+	/**
+	 * Adds removing the node to the fix of the error, see fixNode(). Only a node in an array,
+	 * like a statement, an argument, or an array item, can be removed. Otherwise the error is not fixable.
+	 *
+	 * @param string|null $file the file of the node when it is not the file of the error
+	 * @phpstan-this-out self<T&FixableNodeRuleError>
+	 * @return self<T&FixableNodeRuleError>
+	 */
+	public function removeNode(Node $node, ?string $file = null): self
+	{
+		return $this->fixNode($node, static fn (): int => NodeVisitor::REMOVE_NODE, $file);
+	}
+
+	/**
+	 * @return T
+	 */
+	public function build(): RuleError
+	{
+		/** @var class-string<T> $className */
+		$className = sprintf('PHPStan\\Rules\\RuleErrors\\RuleError%d', $this->type);
+		if (!class_exists($className)) {
+			throw new ShouldNotHappenException(sprintf('Class %s does not exist.', $className));
+		}
+
+		$ruleError = new $className();
+		foreach ($this->properties as $propertyName => $value) {
+			$ruleError->{$propertyName} = $value;
+		}
+
+		if (count($this->tips) > 0) {
+			if (count($this->tips) === 1) {
+				$ruleError->tip = $this->tips[0];
+			} else {
+				$ruleError->tip = implode("\n", array_map(static fn (string $tip) => sprintf('• %s', $tip), $this->tips));
+			}
+		}
+
+		return $ruleError;
+	}
+
+}

@@ -1,0 +1,185 @@
+<?php 
+
+namespace PHPStan\Analyser\StmtHandler;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Stmt;
+use PhpParser\Node\Stmt\Function_;
+use PhpParser\Node\Stmt\Return_;
+use PHPStan\Analyser\AttributesHandler;
+use PHPStan\Analyser\DeprecatedAttributeResolver;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\ImpurePoint;
+use PHPStan\Analyser\InternalStatementResult;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\ParametersProcessor;
+use PHPStan\Analyser\PhpDocsResolver;
+use PHPStan\Analyser\Scope;
+use PHPStan\Analyser\StatementContext;
+use PHPStan\Analyser\StmtHandler;
+use PHPStan\Analyser\VariableLivenessResolver;
+use PHPStan\Dependency\Dependencies;
+use PHPStan\Dependency\DependencyTypes;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Node\ExecutionEndNode;
+use PHPStan\Node\FunctionReturnStatementsNode;
+use PHPStan\Node\InFunctionNode;
+use PHPStan\Node\PropertyAssignNode;
+use PHPStan\Node\ReturnAfterFinallyNode;
+use PHPStan\Node\ReturnStatement;
+use PHPStan\Reflection\Php\PhpFunctionFromParserNodeReflection;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use function array_merge;
+
+/**
+ * @implements StmtHandler<Function_>
+ */
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/FunctionHandler.cpp')]
+final class FunctionHandler implements StmtHandler
+{
+
+	public function __construct(
+		private DeprecatedAttributeResolver $deprecatedAttributeResolver,
+		private PhpDocsResolver $phpDocsResolver,
+		private AttributesHandler $attributesHandler,
+		private ParametersProcessor $parametersProcessor,
+	)
+	{
+	}
+
+	public function supports(Stmt $stmt): bool
+	{
+		return $stmt instanceof Function_;
+	}
+
+	public function processStmt(
+		NodeScopeResolver $nodeScopeResolver,
+		Stmt $stmt,
+		MutatingScope $scope,
+		ExpressionResultStorage $storage,
+		callable $nodeCallback,
+		StatementContext $context,
+	): InternalStatementResult
+	{
+		$dependencies = [];
+		$dependencies[] = $this->attributesHandler->processAttributeGroups($nodeScopeResolver, $stmt, $stmt->attrGroups, $scope, $storage, $nodeCallback);
+		[$templateTypeMap, $phpDocParameterTypes, $phpDocImmediatelyInvokedCallableParameters, $phpDocClosureThisTypeParameters, $phpDocReturnType, $phpDocThrowType, $deprecatedDescription, $isDeprecated, $isInternal, , $isPure, $acceptsNamedArguments, , $phpDocComment, $asserts,, $phpDocParameterOutTypes, , , , $pureUnlessCallableIsImpureParameters, $pureUnlessParameterPassedParameters] = $this->phpDocsResolver->getPhpDocs($scope, $stmt);
+
+		$dependencies[] = $this->parametersProcessor->processParams($nodeScopeResolver, $stmt, $stmt->params, $scope, $storage, $nodeCallback);
+
+		if ($stmt->returnType !== null) {
+			$nodeScopeResolver->callNodeCallback($nodeCallback, $stmt->returnType, $scope, $storage);
+		}
+
+		if (!$isDeprecated) {
+			[$isDeprecated, $deprecatedDescription] = $this->deprecatedAttributeResolver->getDeprecatedAttribute($scope, $stmt);
+		}
+
+		$functionScope = $scope->enterFunction(
+			$stmt,
+			$templateTypeMap,
+			$phpDocParameterTypes,
+			$phpDocReturnType,
+			$phpDocThrowType,
+			$deprecatedDescription,
+			$isDeprecated,
+			$isInternal,
+			$isPure,
+			$acceptsNamedArguments,
+			$asserts,
+			$phpDocComment,
+			$phpDocParameterOutTypes,
+			$phpDocImmediatelyInvokedCallableParameters,
+			$phpDocClosureThisTypeParameters,
+			$pureUnlessCallableIsImpureParameters,
+			$pureUnlessParameterPassedParameters,
+		);
+		$functionReflection = $functionScope->getFunction();
+		if (!$functionReflection instanceof PhpFunctionFromParserNodeReflection) {
+			throw new ShouldNotHappenException();
+		}
+
+		$dependencies[] = Dependencies::create($scope->getFile(), DependencyTypes::ofDeclaration($functionReflection, true));
+		$nodeScopeResolver->callNodeCallback($nodeCallback, new InFunctionNode($functionReflection, $stmt), $functionScope, $storage);
+
+		$gatheredReturnStatements = [];
+		$gatheredReturnStatementsAfterFinally = [];
+		$gatheredYieldStatements = [];
+		$executionEnds = [];
+		$functionImpurePoints = [];
+		// the body's results live in a per-body storage released right after
+		// the FunctionReturnStatementsNode rules ran - see the ClassMethod
+		// branch for the reasoning
+		$bodyStorage = $storage->duplicate();
+		$scope->pushExpressionResultStorage($bodyStorage);
+		try {
+			$nodeScopeResolver->pushNodeGatherer(static function (Node $node, Scope $scope) use ($functionScope, &$gatheredReturnStatements, &$gatheredReturnStatementsAfterFinally, &$gatheredYieldStatements, &$executionEnds, &$functionImpurePoints): void {
+				if ($scope->getFunction() !== $functionScope->getFunction()) {
+					return;
+				}
+				if ($scope->isInAnonymousFunction()) {
+					return;
+				}
+				if ($node instanceof PropertyAssignNode) {
+					$functionImpurePoints[] = new ImpurePoint(
+						$scope,
+						$node,
+						'propertyAssign',
+						'property assignment',
+						true,
+					);
+					return;
+				}
+				if ($node instanceof ExecutionEndNode) {
+					$executionEnds[] = $node;
+					return;
+				}
+				if ($node instanceof ReturnAfterFinallyNode) {
+					$gatheredReturnStatementsAfterFinally[] = new ReturnStatement($scope, $node->getReturnNode());
+					return;
+				}
+				if ($node instanceof Expr\Yield_ || $node instanceof Expr\YieldFrom) {
+					$gatheredYieldStatements[] = $node;
+				}
+				if (!$node instanceof Return_) {
+					return;
+				}
+
+				$gatheredReturnStatements[] = new ReturnStatement($scope, $node);
+			});
+			try {
+				$internalStatementResult = $nodeScopeResolver->processStmtNodesInternal($stmt, $stmt->stmts, $functionScope, $bodyStorage, $nodeCallback, StatementContext::createTopLevel($context->shouldResolveTemplateArguments()));
+				$dependencies[] = $internalStatementResult->getDependencies();
+				$statementResult = $internalStatementResult->toPublic();
+			} finally {
+				$nodeScopeResolver->popNodeGatherer();
+			}
+
+			$nodeScopeResolver->callNodeCallback($nodeCallback, new FunctionReturnStatementsNode(
+				$stmt,
+				$gatheredReturnStatements,
+				$gatheredReturnStatementsAfterFinally,
+				$gatheredYieldStatements,
+				$statementResult,
+				$executionEnds,
+				array_merge($statementResult->getImpurePoints(), $functionImpurePoints),
+				$functionReflection,
+			), $functionScope, $bodyStorage);
+			$nodeScopeResolver->callNodeCallback($nodeCallback, VariableLivenessResolver::resolve($stmt, $internalStatementResult->getVariableFlow()), $functionScope, $bodyStorage);
+		} finally {
+			$scope->popExpressionResultStorage();
+		}
+
+		// declaring the function defines it in global state, so a negative
+		// function_exists() narrowing that may refer to that function must be forgotten
+		$scope = $scope->invalidateExistenceCheckExpressions(['function_exists'], $functionReflection->getName());
+
+		return new InternalStatementResult($scope, hasYield: false, isAlwaysTerminating: false, exitPoints: [], throwPoints: [], impurePoints: [], dependencies: Dependencies::merge(...$dependencies));
+	}
+
+}

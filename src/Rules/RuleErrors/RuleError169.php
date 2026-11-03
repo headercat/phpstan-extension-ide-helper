@@ -1,0 +1,54 @@
+<?php 
+
+namespace PHPStan\Rules\RuleErrors;
+return;
+
+use PHPStan\Rules\FixableNodeRuleError;
+use PHPStan\Rules\MetadataRuleError;
+use PHPStan\Rules\NodeFix;
+use PHPStan\Rules\RuleError;
+use PHPStan\Rules\TipRuleError;
+
+/**
+ * @internal Use PHPStan\Rules\RuleErrorBuilder instead.
+ */
+final class RuleError169 implements RuleError, TipRuleError, MetadataRuleError, FixableNodeRuleError
+{
+
+	public string $message;
+
+	public string $tip;
+
+	/** @var mixed[] */
+	public array $metadata;
+
+	/** @var non-empty-list<NodeFix> */
+	public array $nodeFixes;
+
+	public function getMessage(): string
+	{
+		return $this->message;
+	}
+
+	public function getTip(): string
+	{
+		return $this->tip;
+	}
+
+	/**
+	 * @return mixed[]
+	 */
+	public function getMetadata(): array
+	{
+		return $this->metadata;
+	}
+
+	/**
+	 * @return non-empty-list<NodeFix>
+	 */
+	public function getNodeFixes(): array
+	{
+		return $this->nodeFixes;
+	}
+
+}
