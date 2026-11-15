@@ -1,0 +1,108 @@
+<?php 
+
+namespace PHPStan\Analyser\ExprHandler\Virtual;
+return;
+
+use PhpParser\Node\Expr;
+use PhpParser\Node\Name;
+use PhpParser\Node\Stmt;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\ExpressionResult;
+use PHPStan\Analyser\ExpressionResultFactory;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\ExprHandler;
+use PHPStan\Analyser\ExprHandler\Helper\DefaultNarrowingHelper;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\TypeSpecifierContext;
+use PHPStan\Analyser\VariableFlow;
+use PHPStan\Dependency\Dependencies;
+use PHPStan\Dependency\DependencyTypes;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Node\InstantiationCallableNode;
+use PHPStan\Reflection\InitializerExprContext;
+use PHPStan\Reflection\InitializerExprTypeResolver;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\Type;
+
+/**
+ * @implements ExprHandler<InstantiationCallableNode>
+ */
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../../turbo-ext/src/InstantiationCallableNodeHandler.cpp')]
+final class InstantiationCallableNodeHandler implements ExprHandler
+{
+
+	public function __construct(
+		private ExpressionResultFactory $expressionResultFactory,
+		private DefaultNarrowingHelper $defaultNarrowingHelper,
+		private InitializerExprTypeResolver $initializerExprTypeResolver,
+	)
+	{
+	}
+
+	public function supports(Expr $expr): bool
+	{
+		return $expr instanceof InstantiationCallableNode;
+	}
+
+	public function processExpr(NodeScopeResolver $nodeScopeResolver, Stmt $stmt, Expr $expr, MutatingScope $scope, ExpressionResultStorage $storage, callable $nodeCallback, ExpressionContext $context): ExpressionResult
+	{
+		$beforeScope = $scope;
+		$throwPoints = [];
+		$impurePoints = [];
+		$hasYield = false;
+		$isAlwaysTerminating = false;
+		$classResult = null;
+		if ($expr->getClass() instanceof Expr) {
+			$classResult = $nodeScopeResolver->processExprNode($stmt, $expr->getClass(), $scope, $storage, $nodeCallback, ExpressionContext::createDeep($context->shouldResolveTemplateArguments()));
+			$scope = $classResult->getScope();
+			$hasYield = $classResult->hasYield();
+			$throwPoints = $classResult->getThrowPoints();
+			$impurePoints = $classResult->getImpurePoints();
+			$isAlwaysTerminating = $classResult->isAlwaysTerminating();
+		}
+
+		$result = $this->expressionResultFactory->create(
+			$scope,
+			beforeScope: $beforeScope,
+			expr: $expr,
+			variableFlow: VariableFlow::sequence($classResult?->getVariableFlow()),
+			hasYield: $hasYield,
+			isAlwaysTerminating: $isAlwaysTerminating,
+			throwPoints: $throwPoints,
+			impurePoints: $impurePoints,
+			typeCallback: fn (bool $nativeTypesPromoted): Type => $this->initializerExprTypeResolver->getFirstClassCallableType($expr->getOriginalNode(), InitializerExprContext::fromScope($beforeScope), $nativeTypesPromoted),
+			specifyTypesCallback: fn (TypeSpecifierContext $context, bool $nativeTypesPromoted) => $this->defaultNarrowingHelper->specifyDefaultTypes($expr, $context),
+		);
+
+		return $result->withDependencies(Dependencies::merge(
+			$classResult?->getDependencies(),
+			$this->getDependencies($beforeScope, $expr, $classResult, $result),
+		));
+	}
+
+	/**
+	 * The instantiated class - named, or named by a string the type system resolved.
+	 */
+	private function getDependencies(MutatingScope $scope, InstantiationCallableNode $expr, ?ExpressionResult $classResult, ExpressionResult $result): ?Dependencies
+	{
+		$types = [];
+		$callableType = $result->getType();
+		if ($callableType->isCallable()->yes()) {
+			foreach ($callableType->getCallableParametersAcceptors($scope) as $variant) {
+				$types[] = $variant->getReturnType();
+			}
+		}
+		$class = $expr->getClass();
+		if ($class instanceof Name) {
+			return Dependencies::create($scope->getFile(), $types, [$scope->resolveName($class)]);
+		}
+		if ($classResult === null) {
+			return Dependencies::create($scope->getFile(), $types);
+		}
+
+		return Dependencies::create($scope->getFile(), $types, DependencyTypes::classNamesOfClassString($classResult->getType()));
+	}
+
+}

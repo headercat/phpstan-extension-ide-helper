@@ -1,0 +1,894 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\Stmt\For_;
+use PhpParser\Node\Stmt\Foreach_;
+use PHPStan\Node\Variable\VariableWrite;
+use PHPStan\Node\VariableWritesNode;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\Type;
+use Throwable;
+use function array_diff_key;
+use function array_fill_keys;
+use function array_key_exists;
+use function array_keys;
+use function array_pop;
+use function array_reverse;
+use function array_values;
+use function count;
+use function in_array;
+use function is_int;
+use function is_string;
+use function spl_object_id;
+use function sprintf;
+use function str_ends_with;
+use function str_starts_with;
+use function strlen;
+use function substr;
+
+/** Resolve liveness backwards over immutable body fragments. */
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/VariableLivenessResolver.cpp')]
+final class VariableLivenessResolver
+{
+
+	/** @var array<int, VariableWrite> */
+	private array $writes = [];
+
+	/** @var array<int, true> */
+	private array $readIds = [];
+
+	/** @var array<int, true> */
+	private array $observedIds = [];
+
+	/** @var array<string, true> */
+	private array $readNames = [];
+
+	/** @var array<string, true> */
+	private array $mentionedNames = [];
+
+	/** @var array<string, true> */
+	private array $escapedNames = [];
+
+	/** @var array<int, Type> */
+	private array $redundantTypes = [];
+
+	/** @var array<string, list<VariableAccessFlow>> */
+	private array $accesses = [];
+
+	/** @var array<int, array<string, true>> */
+	private array $readKeys = [];
+
+	/** @var array<string, array<string, true>> */
+	private array $nameKeys = [];
+
+	/** @var array<int, array<string, int|null>> */
+	private array $observedKeys = [];
+
+	/** @var array<int, array<string, true>> */
+	private array $killedKeys = [];
+
+	/** @var array<int, array<int, true>> */
+	private array $dependencies = [];
+
+	/** @var array<int, array<int, true>> */
+	private array $inputCopies = [];
+
+	/** @var array<int, true> */
+	private array $inputSinks = [];
+
+	/** @var array<int, array<int, VariableWrite>> */
+	private array $literalItems = [];
+
+	/** @var array<int, true> */
+	private array $coveredIds = [];
+
+	/** @var array<int, string> */
+	private array $overwriteMarkers = [];
+
+	/** @var array<string, array<string, array<string, int>>> variable name => replaced slot => marker => id of the write leaving it */
+	private array $markersBySlot = [];
+
+	/** @var array<string, array<string, int>> variable name => marker => id of the write leaving it */
+	private array $markersByName = [];
+
+	/** @var array<int, true> */
+	private array $overwrittenIds = [];
+
+	/** @var array<string, true> */
+	private array $allReadKeys = [];
+
+	/** @var array<int, Foreach_|For_> */
+	private array $loopStatements = [];
+
+	/** @var array<int, array<int, true>> */
+	private array $ownWriteIds = [];
+
+	/** @var array<int, Foreach_|For_> */
+	private array $variableOverwritingLoops = [];
+
+	private bool $opaque = false;
+
+	private bool $readsAllVariables = false;
+
+	private bool $allNamesMentioned = false;
+
+	private bool $returnsByReference = false;
+
+	/** @var array<int, array{array<string, true>, VariableFlowContext, array<string, true>}> loop flow id => the live sets after it and the head they resolved to */
+	private array $loopHeads = [];
+
+	private function __construct()
+	{
+	}
+
+	public static function resolve(Node\FunctionLike $function, ?VariableFlow $flow): VariableWritesNode
+	{
+		$self = new self();
+		$self->returnsByReference = $function->returnsByRef();
+		$imports = [];
+		foreach ($function->getParams() as $param) {
+			if (!$param->var instanceof Node\Expr\Variable || !is_string($param->var->name)) {
+				continue;
+			}
+			if ($param->byRef || $param->flags !== 0) {
+				$self->escapedNames[$param->var->name] = true;
+				continue;
+			}
+			$imports[] = VariableFlow::write(new VariableWrite($param->var->name, $param->var, spl_object_id($param->var), VariableWrite::KIND_PARAMETER));
+		}
+		if ($function instanceof Node\Expr\Closure) {
+			foreach ($function->uses as $use) {
+				if (!is_string($use->var->name)) {
+					continue;
+				}
+				if ($use->byRef) {
+					$self->escapedNames[$use->var->name] = true;
+					continue;
+				}
+				$imports[] = VariableFlow::write(new VariableWrite($use->var->name, $use->var, spl_object_id($use->var), VariableWrite::KIND_CLOSURE_USE));
+			}
+		}
+		$body = VariableFlow::sequence(...[...$imports, $flow]);
+		$self->collect($body);
+		if ($self->writes !== [] && !$self->opaque) {
+			$self->compileAccesses();
+			$self->liveBefore($body, [], new VariableFlowContext([]));
+			$self->resolveDependencies();
+			$self->resolveCoverage();
+		}
+
+		return new VariableWritesNode($function, array_values($self->writes), $self->observedIds + $self->readIds, $self->readIds, $self->coveredIds, $self->overwrittenIds, $self->readNames, $self->redundantTypes, $self->mentionedNames, $self->escapedNames, $self->variableOverwritingLoops, $self->opaque, $self->allNamesMentioned);
+	}
+
+	private function collect(?VariableFlow $flow): void
+	{
+		if ($flow === null || $flow instanceof VariableInputFlow) {
+			return;
+		}
+		if ($flow instanceof VariableAccessFlow && $flow->name !== 'this' && !in_array($flow->name, Scope::SUPERGLOBAL_VARIABLES, true)) {
+			$this->mentionedNames[$flow->name] = true;
+			$this->accesses[$flow->name][] = $flow;
+			if ($flow->kind === VariableFlow::READ) {
+				$this->readNames[$flow->name] = true;
+			} elseif ($flow->kind === VariableFlow::ESCAPE) {
+				$this->escapedNames[$flow->name] = true;
+			}
+			if ($flow->write !== null && $flow->kind !== VariableFlow::DISCARD) {
+				$id = $flow->write->getId();
+				$this->writes[$id] = $flow->write;
+				$parentId = $flow->write->getParentId();
+				if ($parentId !== null) {
+					$this->literalItems[$parentId][$id] = $flow->write;
+				}
+				if ($flow->type !== null) {
+					$this->redundantTypes[$id] = $flow->type;
+				}
+			}
+		}
+		if ($flow->kind === VariableFlow::READ_ALL) {
+			$this->readsAllVariables = true;
+		}
+		if ($flow->kind === VariableFlow::OPAQUE) {
+			$this->opaque = true;
+		}
+		if (in_array($flow->kind, [VariableFlow::READ_ALL, VariableFlow::MENTION_ALL], true)) {
+			$this->allNamesMentioned = true;
+		}
+		if ($flow instanceof VariableAccessFlow) {
+			return;
+		}
+		if (!$flow instanceof VariableSequenceFlow && !$flow instanceof VariableControlFlow) {
+			throw new ShouldNotHappenException();
+		}
+		foreach ($flow->children as $child) {
+			$this->collect($child);
+		}
+		if (!$flow instanceof VariableControlFlow) {
+			return;
+		}
+		if ($flow->kind === VariableFlow::LOOP_STATEMENT && $flow->stmt !== null) {
+			$ownIds = [];
+			foreach ($flow->ownWrites as $write) {
+				$ownIds[$write->getId()] = true;
+			}
+			foreach ($flow->bindings as $binding) {
+				$this->loopStatements[$binding->getId()] = $flow->stmt;
+				$this->ownWriteIds[$binding->getId()] = $ownIds;
+			}
+		}
+		if ($flow->kind === VariableFlow::RETURN && $flow->name !== null && $this->returnsByReference) {
+			$this->escapedNames[$flow->name] = true;
+		}
+		foreach ($flow->cases as [$condition, $body]) {
+			$this->collect($condition);
+			$this->collect($body);
+		}
+		foreach ($flow->catches as [, $catch]) {
+			$this->collect($catch);
+		}
+	}
+
+	/**
+	 * @param array<string, true> $next
+	 * @return array<string, true>
+	 */
+	private function liveBefore(?VariableFlow $flow, array $next, VariableFlowContext $context): array
+	{
+		if ($flow === null) {
+			return $next;
+		}
+		if ($flow instanceof VariableInputFlow) {
+			if ($flow->targetId === null) {
+				$this->inputSinks[$flow->writeId] = true;
+			} else {
+				$this->inputCopies[$flow->targetId][$flow->writeId] = true;
+			}
+			return $next;
+		}
+		if ($flow instanceof VariableAccessFlow) {
+			if (in_array($flow->kind, [VariableFlow::READ, VariableFlow::ESCAPE], true)) {
+				// a by-reference capture aliases the variable - the value it
+				// holds at that point is observable through the alias
+				if ($flow->kind === VariableFlow::ESCAPE && $this->loopStatements !== []) {
+					$next = $this->passBindingProbes($next, $flow->name, null);
+				}
+				return $next + ($this->readKeys[spl_object_id($flow)] ?? []);
+			}
+			if ($flow->write === null || $flow->kind === VariableFlow::DEFINE) {
+				return $next;
+			}
+			if ($this->loopStatements !== []) {
+				$next = $this->passBindingProbes($next, $flow->name, $flow->write, $flow->kind === VariableFlow::DISCARD);
+			}
+			$id = $flow->write->getId();
+			if ($flow->kind !== VariableFlow::DISCARD) {
+				$this->observeWrite($id, $next);
+				$this->observeOverwrite($flow->write, $next);
+				foreach ($this->literalItems[$id] ?? [] as $item) {
+					$this->observeWrite($item->getId(), $next);
+					$this->observeOverwrite($item, $next);
+				}
+			}
+			$next = self::withoutKeys($next, $this->killedKeys[$id] ?? []);
+			$next = $this->killOverwriteMarkers($flow->write, $next);
+			if (isset($this->overwriteMarkers[$id])) {
+				$next[$this->overwriteMarkers[$id]] = true;
+			}
+			return $next;
+		}
+		if ($flow instanceof VariableSequenceFlow) {
+			if ($flow->kind === VariableFlow::SEQUENCE) {
+				foreach (array_reverse($flow->children) as $child) {
+					$next = $this->liveBefore($child, $next, $context);
+				}
+				return $next;
+			}
+			$names = [];
+			foreach ($flow->children as $child) {
+				$names += $this->liveBefore($child, $next, $context);
+			}
+			return $names;
+		}
+		if (!$flow instanceof VariableControlFlow) {
+			throw new ShouldNotHappenException();
+		}
+		if ($flow->kind === VariableFlow::LOOP_STATEMENT) {
+			// a binding reusing a variable that is read after the loop: the
+			// probe follows the variable backwards through the statement;
+			// surviving to its entry, it is armed to catch the assignment
+			// before the loop whose value the binding replaces
+			foreach ($flow->bindings as $binding) {
+				if (!isset($this->nameKeys[$binding->getVariableName()])) {
+					continue;
+				}
+				foreach (array_keys($this->nameKeys[$binding->getVariableName()]) as $key) {
+					if (!isset($next[$key])) {
+						continue;
+					}
+					$next[self::bindingProbe($binding, false)] = true;
+					break;
+				}
+			}
+			$names = $this->liveBefore($flow->children[0], $next, $context);
+			foreach ($flow->bindings as $binding) {
+				$probe = self::bindingProbe($binding, false);
+				if (!isset($names[$probe])) {
+					continue;
+				}
+				unset($names[$probe]);
+				$names[self::bindingProbe($binding, true)] = true;
+			}
+			return $names;
+		}
+		if ($flow->kind === VariableFlow::ARROW && $flow->arrow !== null) {
+			$outputs = $this->liveBefore($flow->children[1], [], new VariableFlowContext([]));
+			$names = $this->liveBefore($flow->children[0], $outputs, new VariableFlowContext($outputs, uncaught: $outputs));
+			foreach ($flow->arrow->params as $param) {
+				if (!$param->var instanceof Node\Expr\Variable || !is_string($param->var->name)) {
+					continue;
+				}
+				foreach (array_keys($this->nameKeys[$param->var->name] ?? []) as $key) {
+					unset($names[$key]);
+				}
+			}
+			// the arrow function's own writes replace nothing outside of it
+			foreach (array_keys($names) as $key) {
+				if (!str_starts_with($key, "\1")) {
+					continue;
+				}
+				unset($names[$key]);
+			}
+			return $next + $names;
+		}
+		if ($flow->kind === VariableFlow::LOOP) {
+			// Liveness only grows with the live sets after the loop, so the head the loop
+			// resolved to for smaller sets is below the new one and the iteration can start
+			// from it. Each pass of an enclosing loop asks again with sets at least as large,
+			// so a loop nested N deep is no longer walked 2^N times.
+			$head = [];
+			$flowId = spl_object_id($flow);
+			if (isset($this->loopHeads[$flowId])) {
+				[$previousNext, $previousContext, $previousHead] = $this->loopHeads[$flowId];
+				if (self::covers($next, $previousNext) && self::contextCovers($context, $previousContext)) {
+					$head = $previousHead;
+				}
+			}
+			do {
+				$previousCount = count($head);
+				$update = $this->liveBefore($flow->children[2], $head, $context);
+				$loopContext = new VariableFlowContext($context->return, [$next, ...$context->breaks], [$update, ...$context->continues], $context->catches, $context->uncaught);
+				$body = $this->liveBefore($flow->children[1], $update, $loopContext);
+				$afterCondition = $flow->canRepeat ? ($flow->canExit ? $body + $next : $body) : $next;
+				$head = $this->liveBefore($flow->children[0], $afterCondition, $context);
+			} while (count($head) !== $previousCount);
+			$this->loopHeads[$flowId] = [$next, $context, $head];
+
+			return $flow->atLeastOnce ? $this->liveBefore($flow->children[0], $body, $context) : $head;
+		}
+		if ($flow->kind === VariableFlow::SWITCH) {
+			$switchContext = new VariableFlowContext($context->return, [$next, ...$context->breaks], [$next, ...$context->continues], $context->catches, $context->uncaught);
+			$entries = [];
+			$caseNext = $next;
+			$unmatched = $flow->canExit ? $next : [];
+			for ($i = count($flow->cases) - 1; $i >= 0; $i--) {
+				[, $body, $default] = $flow->cases[$i];
+				$caseNext = $this->liveBefore($body, $caseNext, $switchContext);
+				$entries[$i] = $caseNext;
+				if (!$default) {
+					continue;
+				}
+
+				$unmatched = $caseNext;
+			}
+			for ($i = count($flow->cases) - 1; $i >= 0; $i--) {
+				[$condition, , $default] = $flow->cases[$i];
+				if ($default) {
+					continue;
+				}
+				$unmatched = $this->liveBefore($condition, $entries[$i] + $unmatched, $context);
+			}
+			return $this->liveBefore($flow->children[0], $unmatched, $context);
+		}
+		if ($flow->kind === VariableFlow::RETURN) {
+			return $context->return;
+		}
+		if ($flow->kind === VariableFlow::BREAK) {
+			return $context->breaks[$flow->level - 1] ?? [];
+		}
+		if ($flow->kind === VariableFlow::CONTINUE) {
+			return $context->continues[$flow->level - 1] ?? [];
+		}
+		if ($flow->kind === VariableFlow::STOP) {
+			return [];
+		}
+		if ($flow->kind === VariableFlow::THROW) {
+			$names = $flow->canExit ? $next : [];
+			if ($context->catches === []) {
+				return $names + $context->uncaught;
+			}
+			if ($flow->type === null) {
+				throw new ShouldNotHappenException();
+			}
+			if ($flow->canContainAnyThrowable) {
+				foreach ($context->catches as [$catchType, $destination]) {
+					if (!$catchType->isSuperTypeOf(new ObjectType(Throwable::class))->yes()) {
+						continue;
+					}
+					$names += $destination;
+					break;
+				}
+			}
+			foreach ($context->catches as [$catchType, $destination]) {
+				$accepts = $catchType->isSuperTypeOf($flow->type);
+				if (!$accepts->no() || !$flow->type->isSuperTypeOf($catchType)->no()) {
+					$names += $destination;
+				}
+				if ($accepts->yes()) {
+					return $names;
+				}
+			}
+			return $names + $context->uncaught;
+		}
+		if ($flow->kind === VariableFlow::TRY_CATCH) {
+			$finally = $flow->children[1];
+			$normal = $this->liveBefore($finally, $next, $context);
+			$breaks = [];
+			foreach ($context->breaks as $destination) {
+				$breaks[] = $this->liveBefore($finally, $destination, $context);
+			}
+			$continues = [];
+			foreach ($context->continues as $destination) {
+				$continues[] = $this->liveBefore($finally, $destination, $context);
+			}
+			$outerCatches = [];
+			foreach ($context->catches as [$type, $destination]) {
+				$outerCatches[] = [$type, $this->liveBefore($finally, $destination, $context)];
+			}
+			$catchContext = new VariableFlowContext($this->liveBefore($finally, $context->return, $context), $breaks, $continues, $outerCatches, $this->liveBefore($finally, $context->uncaught, $context));
+			$catches = [];
+			foreach ($flow->catches as [$type, $catch]) {
+				$catches[] = [$type, $this->liveBefore($catch, $normal, $catchContext)];
+			}
+			return $this->liveBefore($flow->children[0], $normal, new VariableFlowContext($catchContext->return, $breaks, $continues, [...$catches, ...$outerCatches], $catchContext->uncaught));
+		}
+		if ($flow->kind === VariableFlow::READ_ALL) {
+			$this->readNames += $this->mentionedNames;
+			return $next + $this->allReadKeys;
+		}
+		return $next;
+	}
+
+	/**
+	 * A probe travels in the live set under a key no read can produce. Armed
+	 * once it has survived its loop statement, it records the assignment (or
+	 * by-reference alias) before the loop whose variable the binding takes
+	 * over; the loop's own writes let it through in either state.
+	 */
+	private static function bindingProbe(VariableWrite $binding, bool $armed): string
+	{
+		return sprintf("\0%s\0%d%s", $binding->getVariableName(), $binding->getId(), $armed ? "\0" : '');
+	}
+
+	/**
+	 * @param array<string, true> $next
+	 * @return array<string, true>
+	 */
+	private function passBindingProbes(array $next, string $name, ?VariableWrite $write, bool $discard = false): array
+	{
+		$prefix = sprintf("\0%s\0", $name);
+		foreach (array_keys($next) as $key) {
+			if (!str_starts_with($key, $prefix)) {
+				continue;
+			}
+			$id = substr($key, strlen($prefix));
+			$armed = str_ends_with($id, "\0");
+			$bindingId = (int) ($armed ? substr($id, 0, -1) : $id);
+			if ($write !== null && isset($this->ownWriteIds[$bindingId][$write->getId()])) {
+				continue;
+			}
+			if ($armed && !$discard) {
+				$this->variableOverwritingLoops[$bindingId] = $this->loopStatements[$bindingId];
+			}
+			if ($write === null || $write->isOffsetWrite()) {
+				// an alias or an offset write keeps the variable - the probe
+				// carries on to the assignment that created it
+				continue;
+			}
+			unset($next[$key]);
+		}
+
+		return $next;
+	}
+
+	/** @param int|string $offset */
+	private static function offsetKey($offset): string
+	{
+		return (is_int($offset) ? 'i:' : 's:') . $offset;
+	}
+
+	/** Compile each access once; loop iterations only union and remove its keys. */
+	private function compileAccesses(): void
+	{
+		foreach ($this->accesses as $name => $accesses) {
+			$slots = ['container' => true, 'unknown' => true];
+			foreach ($accesses as $access) {
+				$offset = $access->write !== null ? $access->write->getOffset() : $access->offset;
+				if ($offset === null) {
+					continue;
+				}
+
+				$slots[self::offsetKey($offset)] = true;
+			}
+			$keysBySlot = [];
+			foreach ($accesses as $access) {
+				if (!in_array($access->kind, [VariableFlow::READ, VariableFlow::ESCAPE], true)) {
+					continue;
+				}
+				if ($access->container) {
+					$selected = ['container' => true];
+				} elseif ($access->offset !== null) {
+					$selected = ['container' => true, self::offsetKey($access->offset) => true];
+				} else {
+					$selected = $slots;
+				}
+				foreach (array_keys($selected) as $slot) {
+					$key = $name . "\0" . $slot . "\0" . ($access->targetId ?? 0);
+					$keysBySlot[$slot][$key] = $access->targetId;
+					$this->readKeys[spl_object_id($access)][$key] = true;
+					$this->nameKeys[$name][$key] = true;
+				}
+			}
+			// A dynamic observation sees every offset, including ones never named by a read.
+			if ($this->readsAllVariables) {
+				foreach (array_keys($slots) as $slot) {
+					$key = $name . "\0" . $slot . "\0" . 0;
+					$keysBySlot[$slot][$key] = null;
+					$this->allReadKeys[$key] = true;
+					$this->nameKeys[$name][$key] = true;
+				}
+			}
+			// the keys of every slot, shared by all writes of the whole variable
+			// instead of copied into each of them
+			$allKeys = [];
+			foreach ($keysBySlot as $keys) {
+				$allKeys += $keys;
+			}
+			$offsetKeys = array_diff_key($allKeys, $keysBySlot['container'] ?? []);
+			$allKills = array_fill_keys(array_keys($allKeys), true);
+			foreach ($accesses as $access) {
+				$write = $access->write;
+				if ($write === null) {
+					continue;
+				}
+				$id = $write->getId();
+				$offset = $write->getOffset();
+				if ($write->isOffsetWrite() && $offset !== null) {
+					$keys = $keysBySlot[self::offsetKey($offset)] ?? [];
+					$kills = $write->replacesOffset();
+				} else {
+					$keys = $write->isOffsetWrite() ? $offsetKeys : $allKeys;
+					$kills = !$write->isOffsetWrite();
+				}
+				if ($keys === []) {
+					continue;
+				}
+				$this->observedKeys[$id] = isset($this->observedKeys[$id]) ? $this->observedKeys[$id] + $keys : $keys;
+				if (!$kills) {
+					continue;
+				}
+				$killedKeys = $keys === $allKeys ? $allKills : array_fill_keys(array_keys($keys), true);
+				$this->killedKeys[$id] = isset($this->killedKeys[$id]) ? $this->killedKeys[$id] + $killedKeys : $killedKeys;
+			}
+			$this->compileOverwrites($name, $accesses);
+		}
+	}
+
+	/**
+	 * A write replacing the variable, or one of its offsets, leaves a marker in
+	 * the live set that the previous replacing write of the same slot kills: a
+	 * write finding another write's marker after it reaches that replacement
+	 * on some path, with no replacement in between.
+	 *
+	 * Only the markers are compiled, by slot: which of them a write observes
+	 * or kills is answered against the live set when the write is reached, so
+	 * the work stays linear in the variable's writes.
+	 *
+	 * @param list<VariableAccessFlow> $accesses
+	 */
+	private function compileOverwrites(string $name, array $accesses): void
+	{
+		$markersBySlot = [];
+		foreach ($accesses as $markingAccess) {
+			if ($markingAccess->write === null || $markingAccess->kind !== VariableFlow::WRITE) {
+				continue;
+			}
+			$slot = self::replacedSlot($markingAccess->write);
+			if ($slot === null) {
+				continue;
+			}
+			$id = $markingAccess->write->getId();
+			$marker = "\1" . $name . "\0" . $slot . "\0" . $id;
+			$markersBySlot[$slot][$marker] = $id;
+			$this->overwriteMarkers[$id] = $marker;
+		}
+		if ($markersBySlot === []) {
+			return;
+		}
+
+		$this->markersBySlot[$name] = $markersBySlot;
+		$markersOfName = [];
+		foreach ($markersBySlot as $markers) {
+			$markersOfName += $markers;
+		}
+		$this->markersByName[$name] = $markersOfName;
+	}
+
+	/** The slot a write replaces: '' for the whole variable, null when it keeps the old value. */
+	private static function replacedSlot(VariableWrite $write): ?string
+	{
+		if (!$write->isOffsetWrite()) {
+			return '';
+		}
+		$offset = $write->getOffset();
+		if ($offset === null || !$write->replacesOffset()) {
+			return null;
+		}
+
+		return self::offsetKey($offset);
+	}
+
+	/** @param array<string, true> $next */
+	private function observeWrite(int $id, array $next): void
+	{
+		$observedKeys = $this->observedKeys[$id] ?? [];
+		// walk the smaller of the two sets
+		if (count($observedKeys) > count($next)) {
+			$live = [];
+			foreach (array_keys($next) as $key) {
+				if (!array_key_exists($key, $observedKeys)) {
+					continue;
+				}
+				$live[$key] = $observedKeys[$key];
+			}
+			$observedKeys = $live;
+		}
+		foreach ($observedKeys as $key => $targetId) {
+			if (!isset($next[$key])) {
+				continue;
+			}
+			$this->observedIds[$id] = true;
+			if ($targetId === null) {
+				$this->readIds[$id] = true;
+			} else {
+				$this->dependencies[$targetId][$id] = true;
+			}
+		}
+	}
+
+	/** @param array<string, true> $next */
+	private function observeOverwrite(VariableWrite $write, array $next): void
+	{
+		$markersBySlot = $this->markersBySlot[$write->getVariableName()] ?? null;
+		if ($markersBySlot === null) {
+			return;
+		}
+		$id = $write->getId();
+		$parentId = $write->getParentId();
+		$observedSlots = [''];
+		$offset = $write->getOffset();
+		if ($write->isOffsetWrite() && $offset !== null) {
+			$observedSlots[] = self::offsetKey($offset);
+		}
+		foreach ($observedSlots as $slot) {
+			$markers = $markersBySlot[$slot] ?? [];
+			// walk the smaller of the two sets
+			if (count($markers) <= count($next)) {
+				foreach ($markers as $marker => $writerId) {
+					if (!isset($next[$marker])) {
+						continue;
+					}
+					// a loop running the same write again replaces nothing it
+					// wrote - nor the items of the array literal it assigns
+					if ($writerId === $id || $writerId === $parentId) {
+						continue;
+					}
+					$this->overwrittenIds[$id] = true;
+					return;
+				}
+				continue;
+			}
+			foreach (array_keys($next) as $key) {
+				$writerId = $markers[$key] ?? null;
+				if ($writerId === null || $writerId === $id || $writerId === $parentId) {
+					continue;
+				}
+				$this->overwrittenIds[$id] = true;
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Drops the markers of the slots $write replaces - all of the variable's
+	 * when it replaces the whole variable.
+	 *
+	 * @param array<string, true> $next
+	 * @return array<string, true>
+	 */
+	private function killOverwriteMarkers(VariableWrite $write, array $next): array
+	{
+		$markersBySlot = $this->markersBySlot[$write->getVariableName()] ?? null;
+		if ($markersBySlot === null) {
+			return $next;
+		}
+		$slot = self::replacedSlot($write);
+		if ($slot === null) {
+			return $next;
+		}
+		if ($slot === '') {
+			return self::withoutKeys($next, $this->markersByName[$write->getVariableName()]);
+		}
+
+		return self::withoutKeys($next, $markersBySlot[$slot] ?? []);
+	}
+
+	/**
+	 * @param array<string, true> $set
+	 * @param array<string, true> $subset
+	 */
+	private static function covers(array $set, array $subset): bool
+	{
+		if (count($set) < count($subset)) {
+			return false;
+		}
+		foreach (array_keys($subset) as $key) {
+			if (!isset($set[$key])) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/** Whether each destination of $context covers the same one of $subcontext. */
+	private static function contextCovers(VariableFlowContext $context, VariableFlowContext $subcontext): bool
+	{
+		if (
+			count($context->breaks) !== count($subcontext->breaks)
+			|| count($context->continues) !== count($subcontext->continues)
+			|| count($context->catches) !== count($subcontext->catches)
+			|| !self::covers($context->return, $subcontext->return)
+			|| !self::covers($context->uncaught, $subcontext->uncaught)
+		) {
+			return false;
+		}
+		foreach ($subcontext->breaks as $i => $destination) {
+			if (!self::covers($context->breaks[$i], $destination)) {
+				return false;
+			}
+		}
+		foreach ($subcontext->continues as $i => $destination) {
+			if (!self::covers($context->continues[$i], $destination)) {
+				return false;
+			}
+		}
+		foreach ($subcontext->catches as $i => [$type, $destination]) {
+			if ($context->catches[$i][0] !== $type || !self::covers($context->catches[$i][1], $destination)) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Walks the smaller of the two sets.
+	 *
+	 * @param array<string, true> $next
+	 * @param array<string, mixed> $keys
+	 * @return array<string, true>
+	 */
+	private static function withoutKeys(array $next, array $keys): array
+	{
+		if (count($keys) <= count($next)) {
+			foreach (array_keys($keys) as $key) {
+				unset($next[$key]);
+			}
+
+			return $next;
+		}
+		foreach (array_keys($next) as $key) {
+			if (!array_key_exists($key, $keys)) {
+				continue;
+			}
+			unset($next[$key]);
+		}
+
+		return $next;
+	}
+
+	private function resolveDependencies(): void
+	{
+		$stack = [];
+		foreach (array_keys($this->readIds) as $id) {
+			$stack[] = [$id, false];
+		}
+		foreach (array_keys($this->inputSinks) as $id) {
+			$stack[] = [$id, true];
+		}
+		foreach ($this->writes as $id => $write) {
+			if (!isset($this->escapedNames[$write->getVariableName()])) {
+				continue;
+			}
+			// a write to an aliased variable is observable through the alias,
+			// so whatever flows into it is used; whether the write itself is
+			// read stays with the flow-sensitive capture read
+			$stack[] = [$id, false];
+			$stack[] = [$id, true];
+		}
+		$visited = [];
+		while ($stack !== []) {
+			[$id, $inputs] = array_pop($stack);
+			$key = $id . ($inputs ? ':inputs' : ':value');
+			if (isset($visited[$key])) {
+				continue;
+			}
+			$visited[$key] = true;
+			foreach (array_keys($this->dependencies[$id] ?? []) as $dependency) {
+				$this->readIds[$dependency] = true;
+				$stack[] = [$dependency, false];
+			}
+			foreach (array_keys($this->inputCopies[$id] ?? []) as $source) {
+				$stack[] = [$source, true];
+			}
+			if (!$inputs) {
+				continue;
+			}
+			foreach ($this->literalItems[$id] ?? [] as $item) {
+				$stack[] = [$item->getId(), true];
+			}
+		}
+	}
+
+	/**
+	 * A write whose value flows only into unused writes is covered when one of
+	 * them is never read at all: reporting that write already points at the
+	 * dead chain. Walks the dependency edges backwards from every never-read
+	 * write; a chain that only feeds itself (Psalm's `$b = $b + 1` loop) has
+	 * no such write and stays uncovered.
+	 */
+	private function resolveCoverage(): void
+	{
+		$stack = [];
+		foreach (array_keys($this->writes) as $id) {
+			if (isset($this->observedIds[$id]) || isset($this->readIds[$id])) {
+				continue;
+			}
+
+			$stack[] = $id;
+		}
+		$visited = [];
+		while ($stack !== []) {
+			$id = array_pop($stack);
+			if (isset($visited[$id])) {
+				continue;
+			}
+			$visited[$id] = true;
+			$sources = array_keys($this->dependencies[$id] ?? []);
+			foreach (array_keys($this->inputCopies[$id] ?? []) as $copied) {
+				// the inputs of $copied flow into $id as well
+				$sources = [...$sources, ...array_keys($this->dependencies[$copied] ?? [])];
+			}
+			foreach ($sources as $source) {
+				$this->coveredIds[$source] = true;
+				$stack[] = $source;
+			}
+		}
+	}
+
+}

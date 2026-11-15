@@ -1,0 +1,64 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use Closure;
+use PhpParser\Node\Expr\StaticCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\TrinaryLogic;
+use PHPStan\Type\BenevolentUnionType;
+use PHPStan\Type\ClosureType;
+use PHPStan\Type\DynamicStaticMethodReturnTypeExtension;
+use PHPStan\Type\NullType;
+use PHPStan\Type\Type;
+
+#[AutowiredService]
+final class ClosureBindDynamicReturnTypeExtension implements DynamicStaticMethodReturnTypeExtension
+{
+
+	public function getClass(): string
+	{
+		return Closure::class;
+	}
+
+	public function isStaticMethodSupported(MethodReflection $methodReflection): bool
+	{
+		return $methodReflection->getName() === 'bind';
+	}
+
+	public function getTypeFromStaticMethodCall(MethodReflection $methodReflection, StaticCall $methodCall, Scope $scope): ?Type
+	{
+		$args = $methodCall->getArgs();
+		if (!isset($args[0])) {
+			return null;
+		}
+
+		$closureType = $scope->getType($args[0]->value);
+		if (!($closureType instanceof ClosureType)) {
+			return null;
+		}
+
+		$newThisIsNull = isset($args[1]) ? $scope->getType($args[1]->value)->isNull() : TrinaryLogic::createYes();
+		if ($closureType->isStaticClosure()->yes()) {
+			if ($newThisIsNull->yes()) {
+				return $closureType;
+			}
+			if ($newThisIsNull->no()) {
+				return new NullType();
+			}
+
+			return new BenevolentUnionType([$closureType, new NullType()]);
+		}
+
+		$origin = $closureType->getOrigin();
+		if ($newThisIsNull->yes() && $origin !== null && $origin->keepsCalledOnObject()) {
+			return new NullType();
+		}
+
+		return new BenevolentUnionType([$closureType, new NullType()]);
+	}
+
+}

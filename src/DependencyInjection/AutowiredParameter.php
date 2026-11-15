@@ -1,0 +1,28 @@
+<?php 
+
+namespace PHPStan\DependencyInjection;
+return;
+
+use Attribute;
+
+/**
+ * Autowires constructor parameters in service classes using #[AutowiredService],
+ * #[GenerateFactory], #[RegisteredRule] or #[RegisteredCollector] attributes.
+ *
+ * If ref is omitted, it looks for parameter of the same name.
+ *
+ * Works thanks to https://github.com/ondrejmirtes/composer-attribute-collector
+ * and AutowiredAttributeServicesExtension.
+ *
+ * @api
+ */
+#[Attribute(flags: Attribute::TARGET_PARAMETER)]
+final class AutowiredParameter
+{
+
+	/** @api */
+	public function __construct(public ?string $ref = null)
+	{
+	}
+
+}

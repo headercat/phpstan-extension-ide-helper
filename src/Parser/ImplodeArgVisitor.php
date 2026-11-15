@@ -1,0 +1,35 @@
+<?php 
+
+namespace PHPStan\Parser;
+return;
+
+use Override;
+use PhpParser\Node;
+use PhpParser\NodeVisitorAbstract;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use function in_array;
+
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/ImplodeArgVisitor.cpp')]
+final class ImplodeArgVisitor extends NodeVisitorAbstract
+{
+
+	public const ATTRIBUTE_NAME = 'isImplodeArg';
+
+	#[Override]
+	public function enterNode(Node $node): ?Node
+	{
+		if ($node instanceof Node\Expr\FuncCall && $node->name instanceof Node\Name && !$node->isPartialFunctionApplication()) {
+			$functionName = $node->name->toLowerString();
+			if (in_array($functionName, ['implode', 'join'], true)) {
+				$args = $node->getArgs();
+				if (isset($args[0])) {
+					$args[0]->setAttribute(self::ATTRIBUTE_NAME, true);
+				}
+			}
+		}
+		return null;
+	}
+
+}

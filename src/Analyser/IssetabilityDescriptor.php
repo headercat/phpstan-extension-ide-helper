@@ -1,0 +1,187 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use Closure;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Expr\ArrayDimFetch;
+use PhpParser\Node\Expr\PropertyFetch;
+use PhpParser\Node\Expr\StaticPropertyFetch;
+use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Identifier;
+use PHPStan\Node\Expr\PropertyInitializationExpr;
+use PHPStan\Rules\Properties\FoundPropertyReflection;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\TrinaryLogic;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\NeverType;
+
+/**
+ * The inside-out carrier for isset/empty/?? chains. Each chain-link
+ * ExpressionResult (variable / array dim fetch / property fetch) holds the
+ * descriptor for its own link plus references to the child ExpressionResult(s),
+ * built during the single pass like containsNullsafe.
+ *
+ * resolve() walks the chain once on the asking scope and produces an
+ * IssetabilityResolution of fully-resolved IssetabilityLinkInfo facts. The engine
+ * (IssetabilityResolution::isSet) and the rule (PHPStan\Rules\IssetCheck) read
+ * those facts; neither re-traverses the AST nor re-resolves types/reflections.
+ */
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/IssetabilityDescriptor.cpp')]
+final class IssetabilityDescriptor
+{
+
+	private const KIND_VARIABLE = 'variable';
+	private const KIND_OFFSET = 'offset';
+	private const KIND_PROPERTY = 'property';
+
+	/**
+	 * @param Closure(MutatingScope): ?FoundPropertyReflection|null $reflectionResolver
+	 * @param PropertyFetch|StaticPropertyFetch|null $propertyFetch
+	 */
+	private function __construct(
+		private string $kind,
+		private ?string $variableName = null,
+		private ?ExpressionResult $varResult = null,
+		private ?ExpressionResult $dimResult = null,
+		private ?ExpressionResult $innerResult = null,
+		private ?Closure $reflectionResolver = null,
+		private ?Expr $propertyFetch = null,
+	)
+	{
+	}
+
+	public static function variable(string $variableName): self
+	{
+		return new self(self::KIND_VARIABLE, variableName: $variableName);
+	}
+
+	public static function offset(ExpressionResult $varResult, ExpressionResult $dimResult): self
+	{
+		return new self(self::KIND_OFFSET, varResult: $varResult, dimResult: $dimResult);
+	}
+
+	/**
+	 * @param Closure(MutatingScope): ?FoundPropertyReflection $reflectionResolver
+	 * @param PropertyFetch|StaticPropertyFetch $propertyFetch
+	 */
+	public static function property(?ExpressionResult $innerResult, Closure $reflectionResolver, Expr $propertyFetch): self
+	{
+		return new self(self::KIND_PROPERTY, innerResult: $innerResult, reflectionResolver: $reflectionResolver, propertyFetch: $propertyFetch);
+	}
+
+	/**
+	 * Walks the chain once on the asking scope, resolving every link's facts.
+	 * $expr is the expression this descriptor belongs to (threaded by
+	 * ExpressionResult::getIssetabilityResolution); $useNativeTypes selects native
+	 * vs phpdoc types (the rule's treatPhpDocTypesAsCertain).
+	 */
+	public function resolve(MutatingScope $scope, bool $useNativeTypes, Expr $expr, bool $reprocessUntrackedLinks = false): IssetabilityResolution
+	{
+		if ($this->kind === self::KIND_VARIABLE) {
+			$variableName = $this->variableName;
+			if ($variableName === null) {
+				throw new ShouldNotHappenException();
+			}
+
+			$hasVariable = $scope->hasVariableType($variableName);
+			$valueType = $hasVariable->yes()
+				? ($useNativeTypes ? $scope->doNotTreatPhpDocTypesAsCertain()->getVariableType($variableName) : $scope->getVariableType($variableName))
+				: new NeverType();
+
+			return new IssetabilityResolution(IssetabilityLinkInfo::variable($variableName, $hasVariable, $valueType), null);
+		}
+
+		if ($this->kind === self::KIND_OFFSET) {
+			$varResult = $this->varResult;
+			$dimResult = $this->dimResult;
+			if ($varResult === null || $dimResult === null) {
+				throw new ShouldNotHappenException();
+			}
+
+			// The stored results of the chain links were priced under the
+			// isset/empty/?? walk's ensured non-nullability (NonNullabilityHelper):
+			// a link deviced non-null also narrows the fetches it is read from,
+			// so their own types have null already stripped - folding the verdict
+			// from them would be circular. A fetch the asking scope does not track
+			// reads its state there instead, derived from its receiver's state
+			// without a walk. Any other untracked link is re-priced on the asking
+			// scope by a rule-facing resolution; engine-side folds keep its stored
+			// read (re-pricing there would walk).
+			$varExpr = $varResult->getExpr();
+			$isVarTracked = $scope->hasExpressionType($varExpr)->yes();
+			if (
+				!$isVarTracked
+				&& !$varResult->containsNullsafe()
+				&& ($varExpr instanceof ArrayDimFetch || $varExpr instanceof PropertyFetch || $varExpr instanceof StaticPropertyFetch)
+			) {
+				$varType = ($useNativeTypes ? $scope->doNotTreatPhpDocTypesAsCertain() : $scope)->getStateType($varExpr);
+			} elseif ($reprocessUntrackedLinks && !$isVarTracked) {
+				$varType = $useNativeTypes ? $scope->doNotTreatPhpDocTypesAsCertain()->getNativeType($varExpr) : $scope->getType($varExpr);
+			} else {
+				$varType = $varResult->getTypeOnScope($scope, $useNativeTypes);
+			}
+			$dimType = $dimResult->getTypeOnScope($scope, $useNativeTypes);
+			$hasOffsetValue = $varType->hasOffsetValueType($dimType);
+			$valueType = $hasOffsetValue->no() ? new NeverType() : $varType->getOffsetValueType($dimType);
+
+			return new IssetabilityResolution(
+				IssetabilityLinkInfo::offset(
+					$varType->isOffsetAccessible(),
+					$hasOffsetValue,
+					$scope->hasExpressionType($expr)->yes(),
+					$varType,
+					$dimType,
+					$valueType,
+				),
+				$varResult->getIssetabilityResolution($scope, $useNativeTypes, $reprocessUntrackedLinks),
+			);
+		}
+
+		$reflectionResolver = $this->reflectionResolver;
+		$propertyFetch = $this->propertyFetch;
+		if ($reflectionResolver === null || $propertyFetch === null) {
+			throw new ShouldNotHappenException();
+		}
+
+		$inner = $this->innerResult?->getIssetabilityResolution($scope, $useNativeTypes, $reprocessUntrackedLinks);
+
+		$propertyReflection = $reflectionResolver($scope);
+		if ($propertyReflection === null) {
+			return new IssetabilityResolution(
+				IssetabilityLinkInfo::property(null, $propertyFetch, false, false, TrinaryLogic::createNo(), new NeverType(), new NeverType(), false, false, false, false, false, false, false),
+				$inner,
+			);
+		}
+
+		$hasNativeType = $propertyReflection->hasNativeType();
+		$nativeReflection = $propertyReflection->getNativeReflection();
+		$initializedThisProperty = $propertyFetch instanceof PropertyFetch
+			&& $propertyFetch->name instanceof Identifier
+			&& $propertyFetch->var instanceof Variable
+			&& $propertyFetch->var->name === 'this'
+			&& $scope->hasExpressionType(new PropertyInitializationExpr($propertyReflection->getName()))->yes();
+
+		return new IssetabilityResolution(
+			IssetabilityLinkInfo::property(
+				$propertyReflection,
+				$propertyFetch,
+				$propertyReflection->isNative(),
+				$hasNativeType,
+				$propertyReflection->isVirtual(),
+				$propertyReflection->getWritableType(),
+				$hasNativeType ? $propertyReflection->getNativeType() : new NeverType(),
+				$scope->hasExpressionType($propertyFetch)->yes(),
+				$initializedThisProperty,
+				$nativeReflection !== null,
+				$nativeReflection !== null && $nativeReflection->isPromoted(),
+				$nativeReflection !== null && $nativeReflection->isReadOnly(),
+				$nativeReflection !== null && $nativeReflection->isHooked(),
+				$nativeReflection !== null && $nativeReflection->getNativeReflection()->hasDefaultValue(),
+			),
+			$inner,
+		);
+	}
+
+}

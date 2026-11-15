@@ -1,0 +1,93 @@
+<?php 
+
+namespace PHPStan\Rules\RestrictedUsage;
+return;
+
+use PhpParser\Node;
+use PhpParser\Node\Identifier;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredExtensions;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\DependencyInjection\ExtensionsCollection;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Rules\Rule;
+use PHPStan\Rules\RuleErrorBuilder;
+use PHPStan\Type\ObjectWithoutClassType;
+use PHPStan\Type\TypeCombinator;
+
+/**
+ * @implements Rule<Node\Expr\PropertyFetch>
+ */
+#[AutowiredService]
+final class RestrictedPropertyUsageRule implements Rule
+{
+
+	/**
+	 * @param ExtensionsCollection<RestrictedPropertyUsageExtension> $extensions
+	 */
+	public function __construct(
+		#[AutowiredExtensions(of: RestrictedPropertyUsageExtension::class)]
+		private ExtensionsCollection $extensions,
+		private ReflectionProvider $reflectionProvider,
+	)
+	{
+	}
+
+	public function getNodeType(): string
+	{
+		return Node\Expr\PropertyFetch::class;
+	}
+
+	/**
+	 * @api
+	 */
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$node->name instanceof Identifier) {
+			return [];
+		}
+
+		$extensions = $this->extensions->getAll();
+		if ($extensions === []) {
+			return [];
+		}
+
+		$propertyName = $node->name->name;
+		$propertyCalledOnType = $scope->getType($node->var);
+		// the intersection only removes what is not an object, such as the null of a nullable type
+		$objectType = $propertyCalledOnType->isObject()->yes() ? $propertyCalledOnType : TypeCombinator::intersect($propertyCalledOnType, new ObjectWithoutClassType());
+		$referencedClasses = $objectType->getObjectClassNames();
+
+		$errors = [];
+
+		foreach ($referencedClasses as $referencedClass) {
+			if (!$this->reflectionProvider->hasClass($referencedClass)) {
+				continue;
+			}
+
+			$classReflection = $this->reflectionProvider->getClass($referencedClass);
+			if (!$classReflection->hasInstanceProperty($propertyName)) {
+				continue;
+			}
+
+			$propertyReflection = $classReflection->getInstanceProperty($propertyName, $scope);
+			foreach ($extensions as $extension) {
+				$restrictedUsage = $extension->isRestrictedPropertyUsage($propertyReflection, $scope);
+				if ($restrictedUsage === null) {
+					continue;
+				}
+
+				$errorBuilder = RuleErrorBuilder::message($restrictedUsage->errorMessage)
+					->identifier($restrictedUsage->identifier);
+				if ($restrictedUsage->tip !== null) {
+					$errorBuilder->tip($restrictedUsage->tip);
+				}
+
+				$errors[] = $errorBuilder->build();
+			}
+		}
+
+		return $errors;
+	}
+
+}

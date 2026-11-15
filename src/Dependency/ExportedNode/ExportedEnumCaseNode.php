@@ -1,0 +1,82 @@
+<?php 
+
+namespace PHPStan\Dependency\ExportedNode;
+return;
+
+use JsonSerializable;
+use Override;
+use PHPStan\Dependency\ExportedNode;
+use PHPStan\Dependency\ExportedNodeDecoder;
+use ReturnTypeWillChange;
+
+final class ExportedEnumCaseNode implements ExportedNode, JsonSerializable
+{
+
+	public function __construct(private string $name, private ?string $value, private ?ExportedPhpDocNode $phpDoc)
+	{
+	}
+
+	public function equals(ExportedNode $node): bool
+	{
+		if (!$node instanceof self) {
+			return false;
+		}
+
+		if ($this->phpDoc === null) {
+			if ($node->phpDoc !== null) {
+				return false;
+			}
+		} elseif ($node->phpDoc !== null) {
+			if (!$this->phpDoc->equals($node->phpDoc)) {
+				return false;
+			}
+		} else {
+			return false;
+		}
+
+		return $this->name === $node->name
+			&& $this->value === $node->value;
+	}
+
+	/**
+	 * @param mixed[] $properties
+	 */
+	public static function __set_state(array $properties): self
+	{
+		return new self(
+			$properties['name'],
+			$properties['value'],
+			$properties['phpDoc'],
+		);
+	}
+
+	/**
+	 * @param mixed[] $data
+	 */
+	public static function decode(array $data, ExportedNodeDecoder $decoder): self
+	{
+		return new self(
+			$data['name'],
+			$data['value'],
+			$data['phpDoc'] !== null ? ExportedPhpDocNode::decode($data['phpDoc']['data'], $decoder) : null,
+		);
+	}
+
+	/**
+	 * @return mixed
+	 */
+	#[ReturnTypeWillChange]
+	#[Override]
+	public function jsonSerialize()
+	{
+		return [
+			'type' => self::class,
+			'data' => [
+				'name' => $this->name,
+				'value' => $this->value,
+				'phpDoc' => $this->phpDoc,
+			],
+		];
+	}
+
+}

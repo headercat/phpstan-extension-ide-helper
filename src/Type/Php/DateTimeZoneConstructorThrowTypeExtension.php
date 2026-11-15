@@ -1,0 +1,64 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use DateTimeZone;
+use PhpParser\Node\Expr\StaticCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Type\DynamicStaticMethodThrowTypeExtension;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use Throwable;
+use function count;
+
+#[AutowiredService]
+final class DateTimeZoneConstructorThrowTypeExtension implements DynamicStaticMethodThrowTypeExtension
+{
+
+	public function isStaticMethodSupported(MethodReflection $methodReflection): bool
+	{
+		return $methodReflection->getName() === '__construct' && $methodReflection->getDeclaringClass()->getName() === DateTimeZone::class;
+	}
+
+	public function getThrowTypeFromStaticMethodCall(MethodReflection $methodReflection, StaticCall $methodCall, Scope $scope): ?Type
+	{
+		$args = $methodCall->getArgs();
+		if (count($args) === 0) {
+			return null;
+		}
+
+		$valueType = $scope->getType($args[0]->value);
+		$constantStrings = $valueType->getConstantStrings();
+
+		foreach ($constantStrings as $constantString) {
+			try {
+				new DateTimeZone($constantString->getValue());
+			} catch (Throwable) {
+				return $this->exceptionType($scope);
+			}
+
+			$valueType = TypeCombinator::remove($valueType, $constantString);
+		}
+
+		if (!$valueType instanceof NeverType) {
+			return $this->exceptionType($scope);
+		}
+
+		return null;
+	}
+
+	private function exceptionType(Scope $scope): Type
+	{
+		if ($scope->getPhpVersion()->hasDateTimeExceptions()->yes()) {
+			return new ObjectType('DateInvalidTimeZoneException');
+		}
+
+		return new ObjectType('Exception');
+	}
+
+}

@@ -1,0 +1,647 @@
+<?php 
+
+namespace PHPStan\Reflection\SignatureMap;
+return;
+
+use PhpParser\Node\AttributeGroup;
+use PhpParser\Node\Expr\ConstFetch;
+use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Scalar\String_;
+use PhpParser\Node\Stmt\ClassConst;
+use PhpParser\Node\Stmt\ClassMethod;
+use PhpParser\Node\Stmt\Function_;
+use PHPStan\BetterReflection\Reflection\Adapter\ReflectionMethod;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Php\PhpVersion;
+use PHPStan\Php8StubsMap;
+use PHPStan\PhpDoc\Tag\ParamTag;
+use PHPStan\Reflection\BetterReflection\SourceLocator\FileNodesFetcher;
+use PHPStan\Reflection\InitializerExprContext;
+use PHPStan\Reflection\InitializerExprTypeResolver;
+use PHPStan\Reflection\PassedByReference;
+use PHPStan\Reflection\ReflectionProvider\ReflectionProviderProvider;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Type\ErrorType;
+use PHPStan\Type\FileTypeMapper;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\ParserNodeTypeToPHPStanType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use PHPStan\Type\TypehintHelper;
+use ReflectionFunctionAbstract;
+use function array_key_exists;
+use function array_map;
+use function count;
+use function explode;
+use function in_array;
+use function is_string;
+use function sprintf;
+use function strtolower;
+
+#[AutowiredService(as: Php8SignatureMapProvider::class)]
+final class Php8SignatureMapProvider implements SignatureMapProvider
+{
+
+	private const DIRECTORY = __DIR__ . '/../../../vendor/phpstan/php-8-stubs';
+
+	/** @var array<lowercase-string, array<lowercase-string, array{ClassMethod, string}>> */
+	private array $methodNodes = [];
+
+	/** @var array<lowercase-string, array{Function_, string}> */
+	private array $functionNodes = [];
+
+	/** @var array<lowercase-string, array<lowercase-string, Type|null>> */
+	private array $constantTypes = [];
+
+	private Php8StubsMap $map;
+
+	public function __construct(
+		private FunctionSignatureMapProvider $functionSignatureMapProvider,
+		private FileNodesFetcher $fileNodesFetcher,
+		private FileTypeMapper $fileTypeMapper,
+		private PhpVersion $phpVersion,
+		private InitializerExprTypeResolver $initializerExprTypeResolver,
+		private ReflectionProviderProvider $reflectionProviderProvider,
+	)
+	{
+		$this->map = new Php8StubsMap($phpVersion->getVersionId());
+	}
+
+	public function hasMethodSignature(string $className, string $methodName): bool
+	{
+		$lowerClassName = strtolower($className);
+		if (!array_key_exists($lowerClassName, $this->map->classes)) {
+			return $this->functionSignatureMapProvider->hasMethodSignature($className, $methodName);
+		}
+
+		if ($this->findMethodNode($className, $methodName) === null) {
+			return $this->functionSignatureMapProvider->hasMethodSignature($className, $methodName);
+		}
+
+		return true;
+	}
+
+	/**
+	 * @return array{ClassMethod, string}|null
+	 */
+	private function findMethodNode(string $className, string $methodName): ?array
+	{
+		$lowerClassName = strtolower($className);
+		$lowerMethodName = strtolower($methodName);
+
+		$this->findClassStubs($className);
+		if (isset($this->methodNodes[$lowerClassName][$lowerMethodName])) {
+			return $this->methodNodes[$lowerClassName][$lowerMethodName];
+		}
+
+		return null;
+	}
+
+	private function findClassStubs(string $className): void
+	{
+		$lowerClassName = strtolower($className);
+
+		if (
+			isset($this->methodNodes[$lowerClassName])
+			|| isset($this->constantTypes[$lowerClassName])
+		) {
+			return;
+		}
+
+		$stubFile = self::DIRECTORY . '/' . $this->map->classes[$lowerClassName];
+		$nodes = $this->fileNodesFetcher->fetchNodes($stubFile);
+		$classes = $nodes->getClassNodes();
+		if (count($classes) !== 1) {
+			throw new ShouldNotHappenException(sprintf('Class %s stub not found in %s.', $className, $stubFile));
+		}
+
+		$class = $classes[$lowerClassName];
+		if (count($class) !== 1) {
+			throw new ShouldNotHappenException(sprintf('Class %s stub not found in %s.', $className, $stubFile));
+		}
+
+		$this->methodNodes[$lowerClassName] = [];
+		$this->constantTypes[$lowerClassName] = [];
+
+		// find and remember all methods/constants within the stubFile
+		foreach ($class[0]->getNode()->stmts as $stmt) {
+			if ($stmt instanceof ClassMethod) {
+				if (!$this->isForCurrentVersion($stmt->attrGroups)) {
+					continue;
+				}
+
+				$this->methodNodes[$lowerClassName][$stmt->name->toLowerString()] = [$stmt, $stubFile];
+
+				continue;
+			}
+
+			if (!$stmt instanceof ClassConst) {
+				continue;
+			}
+
+			foreach ($stmt->consts as $const) {
+				if ($stmt->type === null) {
+					continue;
+				}
+
+				if (!$this->isForCurrentVersion($stmt->attrGroups)) {
+					continue;
+				}
+
+				$this->constantTypes[$lowerClassName][$const->name->toLowerString()] = ParserNodeTypeToPHPStanType::resolve($stmt->type, null);
+			}
+		}
+	}
+
+	/**
+	 * @param AttributeGroup[] $attrGroups
+	 */
+	private function isForCurrentVersion(array $attrGroups): bool
+	{
+		foreach ($attrGroups as $attrGroup) {
+			foreach ($attrGroup->attrs as $attr) {
+				if ($attr->name->toString() === 'Until') {
+					$arg = $attr->args[0]->value;
+					if (!$arg instanceof String_) {
+						throw new ShouldNotHappenException();
+					}
+					$parts = explode('.', $arg->value);
+					$versionId = (int) $parts[0] * 10000 + (int) ($parts[1] ?? 0) * 100 + (int) ($parts[2] ?? 0);
+					if ($this->phpVersion->getVersionId() >= $versionId) {
+						return false;
+					}
+				}
+				if ($attr->name->toString() !== 'Since') {
+					continue;
+				}
+
+				$arg = $attr->args[0]->value;
+				if (!$arg instanceof String_) {
+					throw new ShouldNotHappenException();
+				}
+				$parts = explode('.', $arg->value);
+				$versionId = (int) $parts[0] * 10000 + (int) ($parts[1] ?? 0) * 100 + (int) ($parts[2] ?? 0);
+				if ($this->phpVersion->getVersionId() < $versionId) {
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	public function hasFunctionSignature(string $name): bool
+	{
+		$lowerName = strtolower($name);
+		if (!array_key_exists($lowerName, $this->map->functions)) {
+			return $this->functionSignatureMapProvider->hasFunctionSignature($name);
+		}
+
+		return true;
+	}
+
+	public function getMethodSignatures(string $className, string $methodName, ?ReflectionMethod $reflectionMethod): array
+	{
+		return $this->applyTentativeReturnType(
+			$className,
+			$reflectionMethod,
+			$this->getMethodSignaturesWithoutTentativeReturnType($className, $methodName, $reflectionMethod),
+		);
+	}
+
+	/**
+	 * PHP checks a tentative return type of a built-in method like a real one,
+	 * and overriding it with an incompatible type is deprecated,
+	 * so it is used as the native return type when the signature does not have one.
+	 *
+	 * @param array{positional: array<int, FunctionSignature>, named: ?array<int, FunctionSignature>} $signatures
+	 * @return array{positional: array<int, FunctionSignature>, named: ?array<int, FunctionSignature>}
+	 */
+	private function applyTentativeReturnType(string $className, ?ReflectionMethod $reflectionMethod, array $signatures): array
+	{
+		if ($reflectionMethod === null || !$this->phpVersion->hasTentativeReturnTypes()) {
+			return $signatures;
+		}
+
+		$tentativeReturnType = $reflectionMethod->getTentativeReturnType();
+		if ($tentativeReturnType === null) {
+			return $signatures;
+		}
+
+		$nativeReturnType = TypehintHelper::decideTypeFromReflection(
+			$tentativeReturnType,
+			selfClass: $this->reflectionProviderProvider->getReflectionProvider()->getClass($className),
+		);
+		foreach ($signatures as $signatureType => $typeSignatures) {
+			if ($typeSignatures === null) {
+				continue;
+			}
+
+			foreach ($typeSignatures as $i => $signature) {
+				$signatureNativeReturnType = $signature->getNativeReturnType();
+				if (!$signatureNativeReturnType instanceof MixedType || $signatureNativeReturnType->isExplicitMixed()) {
+					continue;
+				}
+
+				$signatures[$signatureType][$i] = new FunctionSignature(
+					$signature->getParameters(),
+					$signature->getReturnType(),
+					$nativeReturnType,
+					$signature->isVariadic(),
+				);
+			}
+		}
+
+		return $signatures;
+	}
+
+	/**
+	 * @return array{positional: array<int, FunctionSignature>, named: ?array<int, FunctionSignature>}
+	 */
+	private function getMethodSignaturesWithoutTentativeReturnType(string $className, string $methodName, ?ReflectionMethod $reflectionMethod): array
+	{
+		$lowerClassName = strtolower($className);
+		if (!array_key_exists($lowerClassName, $this->map->classes)) {
+			return $this->functionSignatureMapProvider->getMethodSignatures($className, $methodName, $reflectionMethod);
+		}
+
+		$methodNode = $this->findMethodNode($className, $methodName);
+		if ($methodNode === null) {
+			return $this->functionSignatureMapProvider->getMethodSignatures($className, $methodName, $reflectionMethod);
+		}
+
+		[$methodNode, $stubFile] = $methodNode;
+
+		$signature = $this->getSignature($methodNode, $className, $stubFile);
+		if ($this->functionSignatureMapProvider->hasMethodSignature($className, $methodName)) {
+			$functionMapSignatures = $this->functionSignatureMapProvider->getMethodSignatures($className, $methodName, $reflectionMethod);
+
+			return $this->getMergedSignatures($signature, $functionMapSignatures, $this->functionSignatureMapProvider->getParametersChangedByDelta(sprintf('%s::%s', $className, $methodName)));
+		}
+
+		return ['positional' => [$signature], 'named' => null];
+	}
+
+	public function getFunctionSignatures(string $functionName, ?string $className, ReflectionFunctionAbstract|null $reflectionFunction): array
+	{
+		$functionNode = $this->findFunctionNode($functionName);
+		if ($functionNode === null) {
+			return $this->functionSignatureMapProvider->getFunctionSignatures($functionName, $className, $reflectionFunction);
+		}
+
+		[$functionNode, $stubFile] = $functionNode;
+
+		$signature = $this->getSignature($functionNode, null, $stubFile);
+		if ($this->functionSignatureMapProvider->hasFunctionSignature($functionName)) {
+			$functionMapSignatures = $this->functionSignatureMapProvider->getFunctionSignatures($functionName, $className, $reflectionFunction);
+
+			return $this->getMergedSignatures($signature, $functionMapSignatures, $this->functionSignatureMapProvider->getParametersChangedByDelta($functionName));
+		}
+
+		return ['positional' => [$signature], 'named' => null];
+	}
+
+	/**
+	 * @return array{Function_, string}|null
+	 */
+	private function findFunctionNode(string $functionName): ?array
+	{
+		$lowerName = strtolower($functionName);
+		if (!array_key_exists($lowerName, $this->map->functions)) {
+			return null;
+		}
+
+		if (isset($this->functionNodes[$lowerName])) {
+			return $this->functionNodes[$lowerName];
+		}
+
+		$stubFile = self::DIRECTORY . '/' . $this->map->functions[$lowerName];
+		$nodes = $this->fileNodesFetcher->fetchNodes($stubFile);
+		$functions = $nodes->getFunctionNodes();
+		if (!array_key_exists($lowerName, $functions)) {
+			throw new ShouldNotHappenException(sprintf('Function %s stub not found in %s.', $functionName, $stubFile));
+		}
+		foreach ($functions[$lowerName] as $functionNode) {
+			if (!$this->isForCurrentVersion($functionNode->getNode()->getAttrGroups())) {
+				continue;
+			}
+
+			return $this->functionNodes[$lowerName] = [$functionNode->getNode(), $stubFile];
+		}
+
+		throw new ShouldNotHappenException(sprintf('Function %s stub not found in %s.', $functionName, $stubFile));
+	}
+
+	public function isFunctionDeprecated(string $functionName): bool
+	{
+		$functionNode = $this->findFunctionNode($functionName);
+
+		return $functionNode !== null && $this->hasDeprecatedAttribute($functionNode[0]->getAttrGroups());
+	}
+
+	public function isMethodDeprecated(string $className, string $methodName): bool
+	{
+		if (!array_key_exists(strtolower($className), $this->map->classes)) {
+			return false;
+		}
+
+		$methodNode = $this->findMethodNode($className, $methodName);
+
+		return $methodNode !== null && $this->hasDeprecatedAttribute($methodNode[0]->getAttrGroups());
+	}
+
+	/**
+	 * @param AttributeGroup[] $attrGroups
+	 */
+	private function hasDeprecatedAttribute(array $attrGroups): bool
+	{
+		foreach ($attrGroups as $attrGroup) {
+			foreach ($attrGroup->attrs as $attr) {
+				if ($attr->name->toString() === 'Deprecated') {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * @param array{positional: array<int, FunctionSignature>, named: ?array<int, FunctionSignature>} $functionMapSignatures
+	 * @param list<int> $parametersChangedByDelta
+	 * @return array{positional: array<int, FunctionSignature>, named: ?array<int, FunctionSignature>}
+	 */
+	private function getMergedSignatures(FunctionSignature $nativeSignature, array $functionMapSignatures, array $parametersChangedByDelta): array
+	{
+		if (count($functionMapSignatures['positional']) === 1) {
+			return ['positional' => [$this->mergeSignatures($nativeSignature, $functionMapSignatures['positional'][0], $parametersChangedByDelta)], 'named' => null];
+		}
+
+		if (count($functionMapSignatures['positional']) === 0) {
+			return ['positional' => [], 'named' => null];
+		}
+
+		return [
+			'positional' => array_map(fn (FunctionSignature $signature): FunctionSignature => $this->withUnknownDefaultValues($nativeSignature, $signature), $functionMapSignatures['positional']),
+			// PHP resolves named arguments against the one signature php-src stubs declare
+			'named' => [$nativeSignature],
+		];
+	}
+
+	/**
+	 * A parameter of a function map variant like mt_rand(int $min, int $max) keeps the unknown default
+	 * of the parameter it stands for, also over a default the PhpStorm stubs make up for it,
+	 * so that combining the variants knows that $min must be passed explicitly before $max.
+	 */
+	private function withUnknownDefaultValues(FunctionSignature $nativeSignature, FunctionSignature $signature): FunctionSignature
+	{
+		$nativeParameters = $nativeSignature->getParameters();
+		$parameters = [];
+		foreach ($signature->getParameters() as $i => $parameter) {
+			$nativeParameter = $nativeParameters[$i] ?? null;
+			if (
+				$nativeParameter === null
+				|| $nativeParameter->getName() !== $parameter->getName()
+				|| !$nativeParameter->getDefaultValue() instanceof ErrorType
+			) {
+				$parameters[] = $parameter;
+				continue;
+			}
+
+			$parameters[] = new ParameterSignature(
+				$parameter->getName(),
+				$parameter->isOptional(),
+				$parameter->getType(),
+				$parameter->getNativeType(),
+				$parameter->passedByReference(),
+				$parameter->isVariadic(),
+				$nativeParameter->getDefaultValue(),
+				$parameter->getOutType(),
+			);
+		}
+
+		return new FunctionSignature(
+			$parameters,
+			$signature->getReturnType(),
+			$signature->getNativeReturnType(),
+			$signature->isVariadic(),
+		);
+	}
+
+	/**
+	 * @param list<int> $parametersChangedByDelta
+	 */
+	private function mergeSignatures(FunctionSignature $nativeSignature, FunctionSignature $functionMapSignature, array $parametersChangedByDelta): FunctionSignature
+	{
+		$parameters = [];
+		foreach ($nativeSignature->getParameters() as $i => $nativeParameter) {
+			if (!array_key_exists($i, $functionMapSignature->getParameters())) {
+				$parameters[] = $nativeParameter;
+				continue;
+			}
+
+			$functionMapParameter = $functionMapSignature->getParameters()[$i];
+			$nativeParameterType = $nativeParameter->getNativeType();
+			if (in_array($i, $parametersChangedByDelta, true)) {
+				// unlike decideType(), keeps out members of the native union type the delta leaves out
+				$parameterType = TypeCombinator::intersect($nativeParameterType, $functionMapParameter->getType());
+			} else {
+				$parameterType = TypehintHelper::decideType(
+					$nativeParameterType,
+					TypehintHelper::decideType(
+						$nativeParameter->getType(),
+						$functionMapParameter->getType(),
+					),
+				);
+			}
+			$parameters[] = new ParameterSignature(
+				$nativeParameter->getName(),
+				$nativeParameter->isOptional(),
+				$parameterType,
+				$nativeParameterType,
+				$nativeParameter->passedByReference()->yes() ? $functionMapParameter->passedByReference() : $nativeParameter->passedByReference(),
+				$nativeParameter->isVariadic(),
+				$nativeParameter->getDefaultValue(),
+				$nativeParameter->getOutType(),
+			);
+		}
+
+		$nativeReturnType = $nativeSignature->getNativeReturnType();
+		if ($nativeReturnType instanceof MixedType && !$nativeReturnType->isExplicitMixed()) {
+			$returnType = $functionMapSignature->getReturnType();
+		} else {
+			$returnType = TypehintHelper::decideType(
+				$nativeReturnType,
+				TypehintHelper::decideType(
+					$nativeSignature->getReturnType(),
+					$functionMapSignature->getReturnType(),
+				),
+			);
+		}
+
+		return new FunctionSignature(
+			$parameters,
+			$returnType,
+			$nativeReturnType,
+			$nativeSignature->isVariadic(),
+		);
+	}
+
+	public function hasMethodMetadata(string $className, string $methodName): bool
+	{
+		return $this->functionSignatureMapProvider->hasMethodMetadata($className, $methodName);
+	}
+
+	public function hasFunctionMetadata(string $name): bool
+	{
+		return $this->functionSignatureMapProvider->hasFunctionMetadata($name);
+	}
+
+	/**
+	 * @return array{hasSideEffects: bool}
+	 */
+	public function getMethodMetadata(string $className, string $methodName): array
+	{
+		return $this->functionSignatureMapProvider->getMethodMetadata($className, $methodName);
+	}
+
+	/**
+	 * @return array{hasSideEffects: bool}
+	 */
+	public function getFunctionMetadata(string $functionName): array
+	{
+		return $this->functionSignatureMapProvider->getFunctionMetadata($functionName);
+	}
+
+	private function getSignature(
+		ClassMethod|Function_ $function,
+		?string $className,
+		string $stubFile,
+	): FunctionSignature
+	{
+		$phpDocParameterTypes = null;
+		$phpDocReturnType = null;
+		if ($function->getDocComment() !== null) {
+			if ($function instanceof ClassMethod) {
+				$functionName = $function->name->toString();
+			} elseif ($function->namespacedName !== null) {
+				$functionName = $function->namespacedName->toString();
+			} else {
+				throw new ShouldNotHappenException();
+			}
+			$phpDoc = $this->fileTypeMapper->getResolvedPhpDoc(
+				$stubFile,
+				$className,
+				null,
+				$functionName,
+				$function->getDocComment()->getText(),
+			);
+			$phpDocParameterTypes = array_map(static fn (ParamTag $param): Type => $param->getType(), $phpDoc->getParamTags());
+			if ($phpDoc->getReturnTag() !== null) {
+				$phpDocReturnType = $phpDoc->getReturnTag()->getType();
+			}
+		}
+
+		$classReflection = null;
+		if ($className !== null) {
+			$reflectionProvider = $this->reflectionProviderProvider->getReflectionProvider();
+			$classReflection = $reflectionProvider->getClass($className);
+		}
+
+		$parameters = [];
+		$variadic = false;
+		foreach ($function->getParams() as $param) {
+			$name = $param->var;
+			if (!$name instanceof Variable || !is_string($name->name)) {
+				throw new ShouldNotHappenException();
+			}
+			$parameterType = ParserNodeTypeToPHPStanType::resolve($param->type, $classReflection);
+			$phpDocParameterType = $phpDocParameterTypes[$name->name] ?? null;
+
+			if ($param->default instanceof ConstFetch) {
+				$constName = (string) $param->default->name;
+				$loweredConstName = strtolower($constName);
+				if ($loweredConstName === 'null') {
+					$parameterType = TypeCombinator::addNull($parameterType);
+					if ($phpDocParameterType !== null) {
+						$phpDocParameterType = TypeCombinator::addNull($phpDocParameterType);
+					}
+				}
+			}
+
+			$defaultValue = null;
+			if ($param->default instanceof ConstFetch && $param->default->name->toString() === 'UNKNOWN') {
+				// see ParameterReflection::getDefaultValue()
+				$defaultValue = new ErrorType();
+			} elseif ($param->default !== null) {
+				$defaultValue = $this->initializerExprTypeResolver->getType(
+					$param->default,
+					InitializerExprContext::fromStubParameter($className, $stubFile, $function),
+				);
+			}
+
+			$parameters[] = new ParameterSignature(
+				$name->name,
+				$param->default !== null || $param->variadic,
+				TypehintHelper::decideType($parameterType, $phpDocParameterType),
+				$parameterType,
+				$param->byRef ? PassedByReference::createCreatesNewVariable() : PassedByReference::createNo(),
+				$param->variadic,
+				$defaultValue,
+				null,
+			);
+
+			$variadic = $variadic || $param->variadic;
+		}
+
+		$returnType = ParserNodeTypeToPHPStanType::resolve($function->getReturnType(), $classReflection);
+
+		return new FunctionSignature(
+			$parameters,
+			TypehintHelper::decideType($returnType, $phpDocReturnType),
+			$returnType,
+			$variadic,
+		);
+	}
+
+	public function hasClassConstantMetadata(string $className, string $constantName): bool
+	{
+		$lowerClassName = strtolower($className);
+		if (!array_key_exists($lowerClassName, $this->map->classes)) {
+			return false;
+		}
+
+		return $this->findConstantType($className, $constantName) !== null;
+	}
+
+	public function getClassConstantMetadata(string $className, string $constantName): array
+	{
+		$lowerClassName = strtolower($className);
+		if (!array_key_exists($lowerClassName, $this->map->classes)) {
+			throw new ShouldNotHappenException();
+		}
+
+		$type = $this->findConstantType($className, $constantName);
+		if ($type === null) {
+			throw new ShouldNotHappenException();
+		}
+
+		return [
+			'nativeType' => $type,
+		];
+	}
+
+	private function findConstantType(string $className, string $constantName): ?Type
+	{
+		$lowerClassName = strtolower($className);
+		$lowerConstantName = strtolower($constantName);
+
+		$this->findClassStubs($className);
+		if (isset($this->constantTypes[$lowerClassName][$lowerConstantName])) {
+			return $this->constantTypes[$lowerClassName][$lowerConstantName];
+		}
+
+		return null;
+	}
+
+}
