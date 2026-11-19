@@ -1,0 +1,163 @@
+<?php 
+
+namespace PHPStan\Command;
+return;
+
+use Nette\Utils\Strings;
+use Phplrt\Contracts\Parser\Exception\ParserExceptionInterface;
+use Phplrt\Source\StringSource;
+use PHPStan\PhpDoc\TypeStringResolver;
+use PHPStan\PhpDocParser\Parser\ParserException;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\Regex\Parser\RegexNode;
+use PHPStan\Type\Regex\Parser\RegexParser;
+use PHPStan\Type\Regex\Parser\RegexSyntaxException;
+use PHPStan\Type\VerbosityLevel;
+use function count;
+use function strrpos;
+use function substr;
+
+final class IgnoredRegexValidator
+{
+
+	public function __construct(
+		private RegexParser $parser,
+		private TypeStringResolver $typeStringResolver,
+	)
+	{
+	}
+
+	public function validate(string $regex): IgnoredRegexValidatorResult
+	{
+		$regex = $this->removeDelimiters($regex);
+
+		try {
+			$ast = $this->parser->parse(StringSource::createFromString($regex));
+		} catch (ParserExceptionInterface | RegexSyntaxException) {
+			return new IgnoredRegexValidatorResult(ignoredTypes: [], anchorsInTheMiddle: false, allErrorsIgnored: false);
+		}
+		if (!$ast instanceof RegexNode) {
+			throw new ShouldNotHappenException();
+		}
+
+		if (Strings::match($regex, '~(?<!\\\\)(?:\\\\\\\\)*\|\|~')) {
+			return new IgnoredRegexValidatorResult(ignoredTypes: [], anchorsInTheMiddle: false, allErrorsIgnored: true, wrongSequence: '||', escapedWrongSequence: '\|\|');
+		}
+		if (Strings::match($regex, '~(?<!\\\\)(?:\\\\\\\\)*\(\)~')) {
+			return new IgnoredRegexValidatorResult(ignoredTypes: [], anchorsInTheMiddle: false, allErrorsIgnored: true, wrongSequence: '()', escapedWrongSequence: '\(\)');
+		}
+
+		return new IgnoredRegexValidatorResult(
+			ignoredTypes: $this->getIgnoredTypes($ast),
+			anchorsInTheMiddle: $this->hasAnchorsInTheMiddle($ast),
+			allErrorsIgnored: false,
+		);
+	}
+
+	/**
+	 * @return array<string, string>
+	 */
+	private function getIgnoredTypes(RegexNode $ast): array
+	{
+		$alternation = $ast->getChildren()[0] ?? null;
+		if ($alternation === null) {
+			return [];
+		}
+
+		if ($alternation->getId() !== '#alternation') {
+			return [];
+		}
+
+		$types = [];
+		foreach ($alternation->getChildren() as $child) {
+			$text = $this->getText($child);
+			if ($text === null) {
+				continue;
+			}
+
+			$matches = Strings::match($text, '#^([a-zA-Z0-9]+)[,]?\s*#');
+			if ($matches === null) {
+				continue;
+			}
+
+			try {
+				$type = $this->typeStringResolver->resolve($matches[1], null);
+			} catch (ParserException) {
+				continue;
+			}
+
+			if ($type instanceof ObjectType) {
+				continue;
+			}
+
+			$typeDescription = $type->describe(VerbosityLevel::typeOnly());
+
+			if ($typeDescription !== $matches[1]) {
+				continue;
+			}
+
+			$types[$typeDescription] = $text;
+		}
+
+		return $types;
+	}
+
+	private function removeDelimiters(string $regex): string
+	{
+		$delimiter = substr($regex, 0, 1);
+		$endDelimiterPosition = strrpos($regex, $delimiter);
+		if ($endDelimiterPosition === false) {
+			throw new ShouldNotHappenException();
+		}
+
+		return substr($regex, 1, $endDelimiterPosition - 1);
+	}
+
+	private function getText(RegexNode $treeNode): ?string
+	{
+		if ($treeNode->getId() === 'token') {
+			return $treeNode->getValueValue();
+		}
+
+		if ($treeNode->getId() === '#concatenation') {
+			$fullText = '';
+			foreach ($treeNode->getChildren() as $child) {
+				$text = $this->getText($child);
+				if ($text === null) {
+					continue;
+				}
+
+				$fullText .= $text;
+			}
+
+			if ($fullText === '') {
+				return null;
+			}
+
+			return $fullText;
+		}
+
+		return null;
+	}
+
+	private function hasAnchorsInTheMiddle(RegexNode $ast): bool
+	{
+		if ($ast->getId() === 'token') {
+			return $ast->getValueToken() === 'anchor' && $ast->getValueValue() === '$';
+		}
+		$childrenCount = count($ast->getChildren());
+		foreach ($ast->getChildren() as $i => $child) {
+			$has = $this->hasAnchorsInTheMiddle($child);
+			if (
+				$has
+				&& ($ast->getId() !== '#concatenation' || $i !== $childrenCount - 1)
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+}

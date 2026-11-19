@@ -1,0 +1,89 @@
+<?php 
+
+namespace PHPStan\Rules\Generators;
+return;
+
+use PhpParser\Node;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\MultipleNodeTypesRule;
+use PHPStan\Rules\RuleErrorBuilder;
+use PHPStan\TrinaryLogic;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\NeverType;
+use function sprintf;
+
+/**
+ * @implements MultipleNodeTypesRule<Node\Expr>
+ */
+#[RegisteredRule(level: 3)]
+final class YieldInGeneratorRule implements MultipleNodeTypesRule
+{
+
+	public function __construct(
+		#[AutowiredParameter]
+		private bool $reportMaybes,
+	)
+	{
+	}
+
+	public function getNodeTypes(): array
+	{
+		return [Node\Expr\Yield_::class, Node\Expr\YieldFrom::class];
+	}
+
+	public function getNodeType(): string
+	{
+		return Node\Expr::class;
+	}
+
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$node instanceof Node\Expr\Yield_ && !$node instanceof Node\Expr\YieldFrom) {
+			return [];
+		}
+
+		$anonymousFunctionReturnType = $scope->getAnonymousFunctionReturnType();
+		$scopeFunction = $scope->getFunction();
+		if ($anonymousFunctionReturnType !== null) {
+			$returnType = $anonymousFunctionReturnType;
+		} elseif ($scopeFunction !== null) {
+			$returnType = $scopeFunction->getReturnType();
+		} else {
+			return [
+				RuleErrorBuilder::message('Yield can be used only inside a function.')
+					->identifier('generator.outOfFunction')
+					->nonIgnorable()
+					->build(),
+			];
+		}
+
+		if ($returnType instanceof MixedType) {
+			return [];
+		}
+
+		if ($returnType instanceof NeverType && $returnType->isExplicit()) {
+			$isSuperType = TrinaryLogic::createNo();
+		} else {
+			$isSuperType = $returnType->isIterable()->and(TrinaryLogic::createFromBoolean(
+				!$returnType->isArray()->yes(),
+			));
+		}
+		if ($isSuperType->yes()) {
+			return [];
+		}
+
+		if ($isSuperType->maybe() && !$this->reportMaybes) {
+			return [];
+		}
+
+		return [
+			RuleErrorBuilder::message(sprintf(
+				'Yield can be used only with these return types: %s.',
+				'Generator, Iterator, Traversable, iterable',
+			))->identifier('generator.returnType')->build(),
+		];
+	}
+
+}

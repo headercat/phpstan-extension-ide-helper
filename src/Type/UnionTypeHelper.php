@@ -1,0 +1,172 @@
+<?php 
+
+namespace PHPStan\Type;
+return;
+
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\Accessory\AccessoryType;
+use PHPStan\Type\Constant\ConstantBooleanType;
+use PHPStan\Type\Constant\ConstantFloatType;
+use PHPStan\Type\Constant\ConstantIntegerType;
+use PHPStan\Type\Constant\ConstantStringType;
+use PHPStan\Type\Enum\EnumCaseObjectType;
+use function count;
+use function is_float;
+use function is_nan;
+use function spl_object_id;
+use function strcasecmp;
+use function usort;
+use const PHP_INT_MIN;
+
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../turbo-ext/src/UnionTypeHelper.cpp')]
+final class UnionTypeHelper
+{
+
+	/**
+	 * @template T of Type
+	 * @param list<T> $types
+	 * @return list<T>
+	 */
+	public static function sortTypes(array $types): array
+	{
+		if (count($types) > 1024) {
+			return $types;
+		}
+
+		usort($types, static function (Type $a, Type $b): int {
+			if ($a instanceof NullType) {
+				return 1;
+			} elseif ($b instanceof NullType) {
+				return -1;
+			}
+
+			if ($a instanceof AccessoryType) {
+				if ($b instanceof AccessoryType) {
+					return self::compareStrings($a->describe(VerbosityLevel::value()), $b->describe(VerbosityLevel::value()));
+				}
+
+				return 1;
+			}
+			if ($b instanceof AccessoryType) {
+				return -1;
+			}
+
+			$aIsBool = $a instanceof ConstantBooleanType;
+			$bIsBool = $b instanceof ConstantBooleanType;
+			if ($aIsBool && !$bIsBool) {
+				return 1;
+			} elseif ($bIsBool && !$aIsBool) {
+				return -1;
+			}
+			if ($a instanceof ConstantScalarType && !$b instanceof ConstantScalarType) {
+				return -1;
+			} elseif (!$a instanceof ConstantScalarType && $b instanceof ConstantScalarType) {
+				return 1;
+			}
+
+			if (
+				(
+					$a instanceof ConstantIntegerType
+					|| $a instanceof ConstantFloatType
+				)
+				&& (
+					$b instanceof ConstantIntegerType
+					|| $b instanceof ConstantFloatType
+				)
+			) {
+				// NAN is unordered (<=> answers 1 both ways), so it goes after every number
+				$aIsNan = is_float($a->getValue()) && is_nan($a->getValue());
+				$bIsNan = is_float($b->getValue()) && is_nan($b->getValue());
+				if ($aIsNan || $bIsNan) {
+					return $aIsNan <=> $bIsNan;
+				}
+				$cmp = $a->getValue() <=> $b->getValue();
+				if ($cmp !== 0) {
+					return $cmp;
+				}
+				if ($a instanceof ConstantIntegerType && $b instanceof ConstantFloatType) {
+					return -1;
+				}
+				if ($b instanceof ConstantIntegerType && $a instanceof ConstantFloatType) {
+					return 1;
+				}
+				return 0;
+			}
+
+			if ($a instanceof IntegerRangeType && $b instanceof IntegerRangeType) {
+				return ($a->getMin() ?? PHP_INT_MIN) <=> ($b->getMin() ?? PHP_INT_MIN);
+			}
+
+			if ($a instanceof IntegerRangeType && $b instanceof IntegerType) {
+				return 1;
+			}
+
+			if ($b instanceof IntegerRangeType && $a instanceof IntegerType) {
+				return -1;
+			}
+
+			if ($a instanceof ConstantStringType && $b instanceof ConstantStringType) {
+				return self::compareStrings($a->getValue(), $b->getValue());
+			}
+
+			if ($a instanceof EnumCaseObjectType && $b instanceof EnumCaseObjectType) {
+				return self::compareStrings(
+					$a->getClassName() . '::' . $a->getEnumCaseName(),
+					$b->getClassName() . '::' . $b->getEnumCaseName(),
+				);
+			}
+
+			if ($a instanceof FloatRangeType && $b instanceof FloatRangeType) {
+				return $a->getMin() <=> $b->getMin();
+			}
+
+			if (
+				($a instanceof CallableType || $a instanceof ClosureType)
+				&& ($b instanceof CallableType || $b instanceof ClosureType)
+			) {
+				return self::compareStrings($a->describe(VerbosityLevel::value()), $b->describe(VerbosityLevel::value()));
+			}
+
+			if ($a->isConstantArray()->yes() && $b->isConstantArray()->yes()) {
+				if ($a->isIterableAtLeastOnce()->no()) {
+					if ($b->isIterableAtLeastOnce()->no()) {
+						return 0;
+					}
+
+					return -1;
+				} elseif ($b->isIterableAtLeastOnce()->no()) {
+					return 1;
+				}
+
+				// usort() compares a member with many others - an array shape, whose description
+				// is costly, is described once. Each sortTypes() call creates the closure anew,
+				// with its own static variables, and binding them here instead of with use()
+				// spares the comparisons that do not reach this branch.
+				static $arrayDescriptions = [];
+
+				return self::compareStrings(
+					$arrayDescriptions[spl_object_id($a)] ??= $a->describe(VerbosityLevel::value()),
+					$arrayDescriptions[spl_object_id($b)] ??= $b->describe(VerbosityLevel::value()),
+				);
+			}
+
+			if ($a->isString()->yes() && $b->isString()->yes()) {
+				return self::compareStrings($a->describe(VerbosityLevel::precise()), $b->describe(VerbosityLevel::precise()));
+			}
+
+			return self::compareStrings($a->describe(VerbosityLevel::typeOnly()), $b->describe(VerbosityLevel::typeOnly()));
+		});
+		return $types;
+	}
+
+	private static function compareStrings(string $a, string $b): int
+	{
+		$cmp = strcasecmp($a, $b);
+		if ($cmp !== 0) {
+			return $cmp;
+		}
+
+		return $a <=> $b;
+	}
+
+}

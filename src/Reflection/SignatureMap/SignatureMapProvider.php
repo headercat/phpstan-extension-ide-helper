@@ -1,0 +1,52 @@
+<?php 
+
+namespace PHPStan\Reflection\SignatureMap;
+return;
+
+use PHPStan\BetterReflection\Reflection\Adapter\ReflectionMethod;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Type\Type;
+use ReflectionFunctionAbstract;
+
+#[AutowiredService(factory: '@PHPStan\Reflection\SignatureMap\SignatureMapProviderFactory::create')]
+interface SignatureMapProvider
+{
+
+	public function hasMethodSignature(string $className, string $methodName): bool;
+
+	public function hasFunctionSignature(string $name): bool;
+
+	/** @return array{positional: array<int, FunctionSignature>, named: ?array<int, FunctionSignature>} */
+	public function getMethodSignatures(string $className, string $methodName, ?ReflectionMethod $reflectionMethod): array;
+
+	/** @return array{positional: array<int, FunctionSignature>, named: ?array<int, FunctionSignature>} */
+	public function getFunctionSignatures(string $functionName, ?string $className, ?ReflectionFunctionAbstract $reflectionFunction): array;
+
+	/** Whether the stub for the configured PHP version marks the function deprecated. */
+	public function isFunctionDeprecated(string $functionName): bool;
+
+	/** Whether the stub for the configured PHP version marks the method deprecated. */
+	public function isMethodDeprecated(string $className, string $methodName): bool;
+
+	public function hasMethodMetadata(string $className, string $methodName): bool;
+
+	public function hasFunctionMetadata(string $name): bool;
+
+	/**
+	 * @return array{hasSideEffects?: bool, pureUnlessCallableIsImpureParameters?: array<string, bool>, pureUnlessParameterPassedParameters?: array<string, bool>}
+	 */
+	public function getMethodMetadata(string $className, string $methodName): array;
+
+	/**
+	 * @return array{hasSideEffects?: bool, pureUnlessCallableIsImpureParameters?: array<string, bool>, pureUnlessParameterPassedParameters?: array<string, bool>}
+	 */
+	public function getFunctionMetadata(string $functionName): array;
+
+	public function hasClassConstantMetadata(string $className, string $constantName): bool;
+
+	/**
+	 * @return array{nativeType: Type}
+	 */
+	public function getClassConstantMetadata(string $className, string $constantName): array;
+
+}

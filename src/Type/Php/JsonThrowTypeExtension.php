@@ -1,0 +1,73 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Name;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\Type\BitwiseFlagHelper;
+use PHPStan\Type\DynamicFunctionThrowTypeExtension;
+use PHPStan\Type\ObjectType;
+use PHPStan\Type\Type;
+use function array_key_exists;
+use function in_array;
+
+#[AutowiredService]
+final class JsonThrowTypeExtension implements DynamicFunctionThrowTypeExtension
+{
+
+	private const ARGUMENTS_POSITIONS = [
+		'json_encode' => 1,
+		'json_decode' => 3,
+	];
+
+	public function __construct(
+		private ReflectionProvider $reflectionProvider,
+		private BitwiseFlagHelper $bitwiseFlagAnalyser,
+	)
+	{
+	}
+
+	public function isFunctionSupported(
+		FunctionReflection $functionReflection,
+	): bool
+	{
+		return in_array(
+			$functionReflection->getName(),
+			[
+				'json_encode',
+				'json_decode',
+			],
+			true,
+		) && $this->reflectionProvider->hasConstant(new Name\FullyQualified('JSON_THROW_ON_ERROR'), null);
+	}
+
+	public function getThrowTypeFromFunctionCall(
+		FunctionReflection $functionReflection,
+		FuncCall $functionCall,
+		Scope $scope,
+	): ?Type
+	{
+		if (!array_key_exists($functionReflection->getName(), self::ARGUMENTS_POSITIONS)) {
+			throw new ShouldNotHappenException();
+		}
+		$argumentPosition = self::ARGUMENTS_POSITIONS[$functionReflection->getName()];
+		$args = $functionCall->getArgs();
+		if (!isset($args[$argumentPosition])) {
+			return null;
+		}
+
+		$optionsExpr = $args[$argumentPosition]->value;
+		if (!$this->bitwiseFlagAnalyser->bitwiseOrContainsConstant($optionsExpr, $scope, 'JSON_THROW_ON_ERROR')->no()) {
+			return new ObjectType('JsonException');
+		}
+
+		return null;
+	}
+
+}

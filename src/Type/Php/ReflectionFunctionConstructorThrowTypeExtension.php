@@ -1,0 +1,59 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Name;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\MethodReflection;
+use PHPStan\Reflection\ReflectionProvider;
+use PHPStan\Type\DynamicStaticMethodThrowTypeExtension;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\Type;
+use PHPStan\Type\TypeCombinator;
+use ReflectionFunction;
+use function count;
+
+#[AutowiredService]
+final class ReflectionFunctionConstructorThrowTypeExtension implements DynamicStaticMethodThrowTypeExtension
+{
+
+	public function __construct(private ReflectionProvider $reflectionProvider)
+	{
+	}
+
+	public function isStaticMethodSupported(MethodReflection $methodReflection): bool
+	{
+		return $methodReflection->getName() === '__construct' && $methodReflection->getDeclaringClass()->getName() === ReflectionFunction::class;
+	}
+
+	public function getThrowTypeFromStaticMethodCall(MethodReflection $methodReflection, StaticCall $methodCall, Scope $scope): ?Type
+	{
+		$args = $methodCall->getArgs();
+		if (count($args) < 1) {
+			return $methodReflection->getThrowType();
+		}
+
+		$valueType = $scope->getType($args[0]->value);
+		foreach ($valueType->getConstantStrings() as $constantString) {
+			if ($constantString->getValue() === '') {
+				return null;
+			}
+
+			if (!$this->reflectionProvider->hasFunction(new Name($constantString->getValue()), $scope)) {
+				return $methodReflection->getThrowType();
+			}
+
+			$valueType = TypeCombinator::remove($valueType, $constantString);
+		}
+
+		if (!$valueType instanceof NeverType) {
+			return $methodReflection->getThrowType();
+		}
+
+		return null;
+	}
+
+}

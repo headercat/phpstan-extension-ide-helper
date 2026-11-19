@@ -1,0 +1,59 @@
+<?php 
+
+namespace PHPStan\Type\Php;
+return;
+
+use PhpParser\Node\Expr\FuncCall;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Reflection\FunctionReflection;
+use PHPStan\Type\Accessory\AccessoryNonFalsyStringType;
+use PHPStan\Type\BenevolentUnionType;
+use PHPStan\Type\DynamicFunctionReturnTypeExtension;
+use PHPStan\Type\FloatRangeType;
+use PHPStan\Type\IntersectionType;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\StringType;
+use PHPStan\Type\Type;
+use PHPStan\Type\UnionType;
+use function count;
+use const INF;
+
+#[AutowiredService]
+final class MicrotimeFunctionReturnTypeExtension implements DynamicFunctionReturnTypeExtension
+{
+
+	public function isFunctionSupported(FunctionReflection $functionReflection): bool
+	{
+		return $functionReflection->getName() === 'microtime';
+	}
+
+	public function getTypeFromFunctionCall(FunctionReflection $functionReflection, FuncCall $functionCall, Scope $scope): Type
+	{
+		$stringType = new IntersectionType([new StringType(), new AccessoryNonFalsyStringType()]);
+		$floatType = FloatRangeType::fromInterval(0.0, INF);
+
+		$args = $functionCall->getArgs();
+		if (count($args) < 1) {
+			return $stringType;
+		}
+
+		$argType = $scope->getType($args[0]->value);
+		$isTrueType = $argType->isTrue();
+		$isFalseType = $argType->isFalse();
+		$compareTypes = $isTrueType->compareTo($isFalseType);
+		if ($compareTypes === $isTrueType) {
+			return $floatType;
+		}
+		if ($compareTypes === $isFalseType) {
+			return $stringType;
+		}
+
+		if ($argType instanceof MixedType) {
+			return new BenevolentUnionType([$stringType, $floatType]);
+		}
+
+		return new UnionType([$stringType, $floatType]);
+	}
+
+}

@@ -1,0 +1,436 @@
+<?php 
+
+namespace PHPStan\Analyser;
+return;
+
+use PhpParser\Node;
+use PHPStan\AnalysedCodeException;
+use PHPStan\BetterReflection\NodeCompiler\Exception\UnableToCompileNode;
+use PHPStan\BetterReflection\Reflection\Exception\CircularReference;
+use PHPStan\BetterReflection\Reflector\Exception\IdentifierNotFound;
+use PHPStan\Collectors\CollectedData;
+use PHPStan\Collectors\Registry as CollectorRegistry;
+use PHPStan\Dependency\Dependencies;
+use PHPStan\Dependency\DependencyResolver;
+use PHPStan\Dependency\ResolvedDependencies;
+use PHPStan\Dependency\RootExportedNode;
+use PHPStan\DependencyInjection\AutowiredExtensions;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\DependencyInjection\ExtensionsCollection;
+use PHPStan\Node\FileNode;
+use PHPStan\Parser\Parser;
+use PHPStan\Parser\ParserErrorsException;
+use PHPStan\Rules\Registry as RuleRegistry;
+use function array_fill_keys;
+use function array_keys;
+use function array_merge;
+use function array_unique;
+use function array_values;
+use function count;
+use function error_reporting;
+use function hash;
+use function is_dir;
+use function is_file;
+use function restore_error_handler;
+use function set_error_handler;
+use function sprintf;
+use const E_DEPRECATED;
+use const E_ERROR;
+use const E_NOTICE;
+use const E_PARSE;
+use const E_STRICT;
+use const E_USER_DEPRECATED;
+use const E_USER_ERROR;
+use const E_USER_NOTICE;
+use const E_USER_WARNING;
+use const E_WARNING;
+
+/**
+ * @phpstan-import-type CollectorData from CollectedData
+ */
+#[AutowiredService]
+final class FileAnalyser
+{
+
+	/** @var array<string, Error> */
+	private array $allPhpErrors = [];
+
+	/** @var array<string, Error> */
+	private array $filteredPhpErrors = [];
+
+	/**
+	 * @param ExtensionsCollection<IgnoreErrorExtension> $ignoreErrorExtensions
+	 */
+	public function __construct(
+		private ScopeFactory $scopeFactory,
+		#[AutowiredParameter(ref: '@' . NodeScopeResolver::class)]
+		private NodeScopeResolver $nodeScopeResolver,
+		#[AutowiredParameter(ref: '@defaultAnalysisParser')]
+		private Parser $parser,
+		#[AutowiredExtensions(of: IgnoreErrorExtension::class)]
+		private ExtensionsCollection $ignoreErrorExtensions,
+		private RuleErrorTransformer $ruleErrorTransformer,
+		private LocalIgnoresProcessor $localIgnoresProcessor,
+		#[AutowiredParameter]
+		private bool $reportIgnoresWithoutComments,
+		private ValueDependencyCollector $valueDependencyCollector,
+		private DependencyResolver $dependencyResolver,
+	)
+	{
+	}
+
+	/**
+	 * The files declaring what the code references, and what the reflection layer found by name -
+	 * from a string, a PHPDoc, a rule asking - during the analysis of the file, or while resolving
+	 * the declarations it depends on: those of the symbols it depends on, and every one of its own.
+	 * Those are remembered for the rest of the process and reused without asking again, so what they
+	 * found is what every file depending on them depends on - also through the declarations of what
+	 * they found.
+	 *
+	 * @param list<RootExportedNode> $exportedNodes what the analysed file declares
+	 * @param array<string, true> $analysedFiles
+	 */
+	private function resolveDependenciesWithFoundSymbols(string $file, ?Dependencies $dependencies, array $exportedNodes, array $analysedFiles): ResolvedDependencies
+	{
+		$resolvedDependencies = $this->dependencyResolver->resolveFileDependencies($dependencies, $analysedFiles);
+		$fileDependencies = array_fill_keys($resolvedDependencies->getFileDependencies(), true);
+		$usedTraitFileDependencies = $resolvedDependencies->getUsedTraitFileDependencies();
+		$packageDependencies = $resolvedDependencies->getPackageDependencies();
+		$classReflections = $resolvedDependencies->getClassReflections();
+
+		// the declarations depended on - every one of the analysed file, and those of the symbols
+		// depended on; what was found while resolving them is depended on too
+		$declarationKeys = $this->valueDependencyCollector->getDeclarationKeysOfFile($file);
+		foreach ($exportedNodes as $exportedNode) {
+			if ($exportedNode->getType() === RootExportedNode::TYPE_FUNCTION) {
+				$declarationKeys[] = ValueDependencyCollector::getFunctionDeclarationKey($exportedNode->getName());
+			} elseif ($exportedNode->getType() !== RootExportedNode::TYPE_CONSTANT) {
+				$declarationKeys[] = ValueDependencyCollector::getClassDeclarationKey($exportedNode->getName());
+			}
+		}
+		$keysToFollow = [];
+		$followedKeys = [];
+		$addDeclarationKeys = static function (ResolvedDependencies $resolved, array $newFiles, array $keys) use (&$keysToFollow, &$followedKeys): void {
+			foreach ($newFiles as $newFile) {
+				$keys[] = ValueDependencyCollector::getFileDeclarationKey($newFile);
+			}
+			foreach ($resolved->getClassReflections() as $classReflection) {
+				$keys[] = ValueDependencyCollector::getClassDeclarationKey($classReflection->getName());
+			}
+			foreach ($resolved->getFunctionNames() as $functionName) {
+				$keys[] = ValueDependencyCollector::getFunctionDeclarationKey($functionName);
+			}
+			foreach ($keys as $key) {
+				if (isset($followedKeys[$key])) {
+					continue;
+				}
+
+				$followedKeys[$key] = true;
+				$keysToFollow[] = $key;
+			}
+		};
+		$addDeclarationKeys($resolvedDependencies, [$file, ...array_keys($fileDependencies)], $declarationKeys);
+
+		$includeAnalysis = true;
+		while ($keysToFollow !== [] || $includeAnalysis) {
+			$foundDependencies = $this->dependencyResolver->createFoundSymbolDependencies(
+				$file,
+				$this->valueDependencyCollector->getFoundSymbols($keysToFollow, $includeAnalysis),
+			);
+			$includeAnalysis = false;
+			$keysToFollow = [];
+			if ($foundDependencies === null) {
+				break;
+			}
+
+			$resolvedFoundDependencies = $this->dependencyResolver->resolveFileDependencies($foundDependencies, $analysedFiles);
+			$newFiles = [];
+			foreach ($resolvedFoundDependencies->getFileDependencies() as $foundFile) {
+				if (isset($fileDependencies[$foundFile])) {
+					continue;
+				}
+
+				$fileDependencies[$foundFile] = true;
+				$newFiles[] = $foundFile;
+			}
+			$addDeclarationKeys($resolvedFoundDependencies, $newFiles, []);
+			$packageDependencies = array_merge($packageDependencies, $resolvedFoundDependencies->getPackageDependencies());
+			$classReflections = array_merge($classReflections, $resolvedFoundDependencies->getClassReflections());
+		}
+
+		return new ResolvedDependencies(
+			array_keys($fileDependencies),
+			$usedTraitFileDependencies,
+			array_values(array_unique($packageDependencies)),
+			$classReflections,
+		);
+	}
+
+	/**
+	 * @param array<string, true> $analysedFiles
+	 * @param callable(Node $node, Scope $scope): void|null $outerNodeCallback
+	 */
+	public function analyseFile(
+		string $file,
+		array $analysedFiles,
+		RuleRegistry $ruleRegistry,
+		CollectorRegistry $collectorRegistry,
+		?callable $outerNodeCallback,
+	): FileAnalyserResult
+	{
+		/** @var list<Error> $fileErrors */
+		$fileErrors = [];
+
+		/** @var list<string> $processedFiles */
+		$processedFiles = [];
+
+		/** @var list<Error> $locallyIgnoredErrors */
+		$locallyIgnoredErrors = [];
+
+		/** @var CollectorData $fileCollectedData */
+		$fileCollectedData = [];
+
+		$fileDependencies = [];
+		$usedTraitFileDependencies = [];
+		$filePackageDependencies = [];
+		$exportedNodes = [];
+		$linesToIgnore = [];
+		$unmatchedLineIgnores = [];
+		$this->valueDependencyCollector->startFile($file);
+		if (is_file($file)) {
+			try {
+				$this->collectErrors($analysedFiles);
+				$parserNodes = $this->parser->parseFile($file);
+				$processedFiles[] = $file;
+
+				$nodeCallback = new FileAnalyserCallback(
+					$file,
+					$ruleRegistry,
+					$collectorRegistry,
+					$outerNodeCallback,
+					$parserNodes,
+					$this->ignoreErrorExtensions->getAll(),
+					$this->parser,
+					$this->ruleErrorTransformer,
+					$processedFiles,
+					$this->dependencyResolver,
+				);
+				$scope = $this->scopeFactory->create(ScopeContext::create($file), $nodeCallback);
+				$nodeCallback(new FileNode($parserNodes), $scope);
+				$this->nodeScopeResolver->resetPerFileAnalysisState();
+				$dependencies = $this->nodeScopeResolver->processFileNodes(
+					$parserNodes,
+					$scope,
+					$nodeCallback,
+				);
+				$fileErrors = $nodeCallback->getFileErrors();
+				$fileCollectedData = $nodeCallback->getFileCollectedData();
+				$exportedNodes = $nodeCallback->getExportedNodes();
+				$resolvedDependencies = $this->resolveDependenciesWithFoundSymbols($file, $dependencies, $exportedNodes, $analysedFiles);
+				$fileDependencies = $resolvedDependencies->getFileDependencies();
+				$usedTraitFileDependencies = $resolvedDependencies->getUsedTraitFileDependencies();
+				$filePackageDependencies = $resolvedDependencies->getPackageDependencies();
+				foreach ($resolvedDependencies->getClassReflections() as $classReflection) {
+					// what an extension described the class with may depend on something - see DeclarationDependencyTracker
+					$this->valueDependencyCollector->noteClassDependency($classReflection);
+				}
+				$linesToIgnore = $nodeCallback->getLinesToIgnore();
+				$unmatchedLineIgnores = $nodeCallback->getUnmatchedLineIgnores();
+				$temporaryFileErrors = $nodeCallback->getTemporaryFileErrors();
+				$processedFiles = $nodeCallback->getProcessedFiles();
+
+				if ($this->reportIgnoresWithoutComments) {
+					foreach ($linesToIgnore as $ignoredFile => $lines) {
+						// an ignore in a trait is disabled in the context of every class using it,
+						// but reported only once, when the trait's own file is analysed
+						$report = $ignoredFile === $file;
+						foreach ($lines as $line => $identifiers) {
+							if ($identifiers === null) {
+								if ($report) {
+									$fileErrors[] = (new Error(
+										'Ignoring all errors on a line is not allowed.',
+										$ignoredFile,
+										$line,
+										false,
+										$ignoredFile,
+										null,
+										'Use @phpstan-ignore with an identifier and a comment (in parentheses).',
+									))->withIdentifier('ignore.allLineErrors');
+								}
+								unset($linesToIgnore[$ignoredFile][$line]);
+								unset($unmatchedLineIgnores[$ignoredFile][$line]);
+								continue;
+							}
+
+							foreach ($identifiers as $identifier) {
+								if ($identifier['comment'] !== null) {
+									continue;
+								}
+
+								if ($report) {
+									$fileErrors[] = (new Error(
+										sprintf('Ignore with identifier %s has no comment.', $identifier['name']),
+										$ignoredFile,
+										$line,
+										false,
+										$ignoredFile,
+										null,
+										'Explain why this ignore is necessary in parentheses after the identifier.',
+									))->withIdentifier('ignore.noComment');
+								}
+								unset($linesToIgnore[$ignoredFile][$line]);
+								unset($unmatchedLineIgnores[$ignoredFile][$line]);
+							}
+						}
+					}
+				}
+
+				$localIgnoresProcessorResult = $this->localIgnoresProcessor->process(
+					$temporaryFileErrors,
+					$linesToIgnore,
+					$unmatchedLineIgnores,
+				);
+				foreach ($localIgnoresProcessorResult->getFileErrors() as $fileError) {
+					$fileErrors[] = $fileError;
+				}
+				foreach ($localIgnoresProcessorResult->getLocallyIgnoredErrors() as $locallyIgnoredError) {
+					$locallyIgnoredErrors[] = $locallyIgnoredError;
+				}
+				$linesToIgnore = $localIgnoresProcessorResult->getLinesToIgnore();
+				$unmatchedLineIgnores = $localIgnoresProcessorResult->getUnmatchedLineIgnores();
+			} catch (\PhpParser\Error $e) {
+				$fileErrors[] = (new Error($e->getRawMessage(), $file, $e->getStartLine() !== -1 ? $e->getStartLine() : null, $e))->withIdentifier('phpstan.parse');
+			} catch (ParserErrorsException $e) {
+				foreach ($e->getErrors() as $error) {
+					$fileErrors[] = (new Error($error->getMessage(), $e->getParsedFile() ?? $file, $error->getLine() !== -1 ? $error->getStartLine() : null, $e))->withIdentifier('phpstan.parse');
+				}
+			} catch (AnalysedCodeException $e) {
+				$fileErrors[] = (new Error($e->getMessage(), $file, canBeIgnored: $e, tip: $e->getTip()))
+					->withIdentifier('phpstan.internal')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+			} catch (IdentifierNotFound $e) {
+				$fileErrors[] = (new Error(sprintf('Reflection error: %s not found.', $e->getIdentifier()->getName()), $file, canBeIgnored: $e, tip: 'Learn more at https://phpstan.org/user-guide/discovering-symbols'))
+					->withIdentifier('phpstan.reflection')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+			} catch (UnableToCompileNode | CircularReference $e) {
+				$fileErrors[] = (new Error(sprintf('Reflection error: %s', $e->getMessage()), $file, canBeIgnored: $e))
+					->withIdentifier('phpstan.reflection')
+					->withMetadata([
+						InternalError::STACK_TRACE_METADATA_KEY => InternalError::prepareTrace($e),
+						InternalError::STACK_TRACE_AS_STRING_METADATA_KEY => $e->getTraceAsString(),
+					]);
+			} finally {
+				$this->restoreCollectErrorsHandler();
+			}
+		} elseif (is_dir($file)) {
+			$fileErrors[] = (new Error(sprintf('File %s is a directory.', $file), $file, canBeIgnored: false))->withIdentifier('phpstan.path');
+		} else {
+			$fileErrors[] = (new Error(sprintf('File %s does not exist.', $file), $file, canBeIgnored: false))->withIdentifier('phpstan.path');
+		}
+
+		foreach ($linesToIgnore as $fileKey => $lines) {
+			if (count($lines) > 0) {
+				continue;
+			}
+
+			unset($linesToIgnore[$fileKey]);
+		}
+
+		foreach ($unmatchedLineIgnores as $fileKey => $lines) {
+			if (count($lines) > 0) {
+				continue;
+			}
+
+			unset($unmatchedLineIgnores[$fileKey]);
+		}
+
+		return new FileAnalyserResult(
+			$fileErrors,
+			array_values($this->filteredPhpErrors),
+			array_values($this->allPhpErrors),
+			$locallyIgnoredErrors,
+			$fileCollectedData,
+			array_values(array_unique($fileDependencies)),
+			array_values(array_unique($usedTraitFileDependencies)),
+			$this->valueDependencyCollector->finishFile(),
+			array_values(array_unique($filePackageDependencies)),
+			$exportedNodes,
+			$linesToIgnore,
+			$unmatchedLineIgnores,
+			$processedFiles,
+		);
+	}
+
+	/**
+	 * @param array<string, true> $analysedFiles
+	 */
+	private function collectErrors(array $analysedFiles): void
+	{
+		$this->filteredPhpErrors = [];
+		$this->allPhpErrors = [];
+		set_error_handler(function (int $errno, string $errstr, string $errfile, int $errline) use ($analysedFiles): bool {
+			if ((error_reporting() & $errno) === 0) {
+				// silence @ operator
+				return true;
+			}
+
+			$errorMessage = sprintf('%s: %s', $this->getErrorLabel($errno), $errstr);
+			$errorSignature = hash('sha256', sprintf('%s:%s::%s', $errfile, $errline, $errorMessage));
+
+			$this->allPhpErrors[$errorSignature] = (new Error($errorMessage, $errfile, $errline, false))->withIdentifier('phpstan.php');
+
+			if ($errno === E_DEPRECATED) {
+				return true;
+			}
+
+			if (!isset($analysedFiles[$errfile])) {
+				return true;
+			}
+
+			$this->filteredPhpErrors[$errorSignature] = (new Error($errorMessage, $errfile, $errline, $errno === E_USER_DEPRECATED))->withIdentifier('phpstan.php');
+
+			return true;
+		});
+	}
+
+	private function restoreCollectErrorsHandler(): void
+	{
+		restore_error_handler();
+	}
+
+	private function getErrorLabel(int $errno): string
+	{
+		switch ($errno) {
+			case E_ERROR:
+				return 'Fatal error';
+			case E_WARNING:
+				return 'Warning';
+			case E_PARSE:
+				return 'Parse error';
+			case E_NOTICE:
+				return 'Notice';
+			case E_DEPRECATED:
+				return 'Deprecated';
+			case E_USER_ERROR:
+				return 'User error (E_USER_ERROR)';
+			case E_USER_WARNING:
+				return 'User warning (E_USER_WARNING)';
+			case E_USER_NOTICE:
+				return 'User notice (E_USER_NOTICE)';
+			case E_USER_DEPRECATED:
+				return 'Deprecated (E_USER_DEPRECATED)';
+			case E_STRICT:
+				return 'Strict error (E_STRICT)';
+		}
+
+		return 'Unknown PHP error';
+	}
+
+}

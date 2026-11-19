@@ -1,0 +1,81 @@
+<?php 
+
+namespace PHPStan\Analyser\ExprHandler;
+return;
+
+use Generator;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Expr\YieldFrom;
+use PhpParser\Node\Stmt;
+use PHPStan\Analyser\ExpressionContext;
+use PHPStan\Analyser\ExpressionResult;
+use PHPStan\Analyser\ExpressionResultFactory;
+use PHPStan\Analyser\ExpressionResultStorage;
+use PHPStan\Analyser\ExprHandler;
+use PHPStan\Analyser\ExprHandler\Helper\DefaultNarrowingHelper;
+use PHPStan\Analyser\ImpurePoint;
+use PHPStan\Analyser\InternalThrowPoint;
+use PHPStan\Analyser\MutatingScope;
+use PHPStan\Analyser\NodeScopeResolver;
+use PHPStan\Analyser\TypeSpecifierContext;
+use PHPStan\Analyser\VariableFlow;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\ErrorType;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\Type;
+use function array_merge;
+
+/**
+ * @implements ExprHandler<YieldFrom>
+ */
+#[AutowiredService]
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/YieldFromHandler.cpp')]
+final class YieldFromHandler implements ExprHandler
+{
+
+	public function __construct(
+		private ExpressionResultFactory $expressionResultFactory,
+		private DefaultNarrowingHelper $defaultNarrowingHelper,
+	)
+	{
+	}
+
+	public function supports(Expr $expr): bool
+	{
+		return $expr instanceof YieldFrom;
+	}
+
+	public function processExpr(NodeScopeResolver $nodeScopeResolver, Stmt $stmt, Expr $expr, MutatingScope $scope, ExpressionResultStorage $storage, callable $nodeCallback, ExpressionContext $context): ExpressionResult
+	{
+		$beforeScope = $scope;
+		$exprResult = $nodeScopeResolver->processExprNode($stmt, $expr->expr, $scope, $storage, $nodeCallback, $context->enterDeep());
+		$scope = $exprResult->getScope();
+		$scope = $scope->addTemplateArgumentConstraints($nodeScopeResolver->collectYieldFromSend($scope, $exprResult->getType()));
+
+		$throwPoint = InternalThrowPoint::createImplicit($scope, $expr);
+
+		return $this->expressionResultFactory->create(
+			$scope,
+			beforeScope: $beforeScope,
+			expr: $expr,
+			variableFlow: VariableFlow::sequence($exprResult->getVariableFlow(), VariableFlow::throwing($throwPoint->getType(), true)),
+			hasYield: true,
+			isAlwaysTerminating: $exprResult->isAlwaysTerminating(),
+			throwPoints: array_merge($exprResult->getThrowPoints(), [$throwPoint]),
+			impurePoints: array_merge($exprResult->getImpurePoints(), [new ImpurePoint($scope, $expr, 'yieldFrom', 'yield from', true)]),
+			typeCallback: static function (bool $nativeTypesPromoted) use ($exprResult): Type {
+				$yieldFromType = ($nativeTypesPromoted ? $exprResult->getNativeType() : $exprResult->getType());
+				$generatorReturnType = $yieldFromType->getTemplateType(Generator::class, 'TReturn');
+				if ($generatorReturnType instanceof ErrorType) {
+					return new MixedType();
+				}
+
+				return $generatorReturnType;
+			},
+			specifyTypesCallback: fn (TypeSpecifierContext $context, bool $nativeTypesPromoted) => $this->defaultNarrowingHelper->specifyDefaultTypes($expr, $context),
+			dependencies: $exprResult->getDependencies(),
+		);
+	}
+
+}

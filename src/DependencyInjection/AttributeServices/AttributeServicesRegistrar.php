@@ -1,0 +1,390 @@
+<?php 
+
+namespace PHPStan\DependencyInjection\AttributeServices;
+return;
+
+use Nette\DI\ContainerBuilder;
+use Nette\DI\Definitions\Reference;
+use Nette\DI\Definitions\ServiceDefinition;
+use Nette\DI\Definitions\Statement;
+use Nette\DI\Helpers;
+use Nette\Neon\Entity;
+use Nette\Neon\Neon;
+use Nette\PhpGenerator\Dumper;
+use Nette\PhpGenerator\PhpLiteral;
+use olvlvl\ComposerAttributeCollector\TargetClass;
+use olvlvl\ComposerAttributeCollector\TargetMethodParameter;
+use PHPStan\Collectors\RegistryFactory;
+use PHPStan\DependencyInjection\AutowiredParameter;
+use PHPStan\DependencyInjection\AutowiredService;
+use PHPStan\DependencyInjection\Conditional;
+use PHPStan\DependencyInjection\ConditionalTagsExtension;
+use PHPStan\DependencyInjection\GenerateFactory;
+use PHPStan\DependencyInjection\NonAutowiredService;
+use PHPStan\DependencyInjection\RegisteredCollector;
+use PHPStan\DependencyInjection\RegisteredRule;
+use PHPStan\Rules\LazyRegistry;
+use PHPStan\ShouldNotHappenException;
+use ReflectionClass;
+use function array_key_exists;
+use function array_slice;
+use function count;
+use function explode;
+use function implode;
+use function is_array;
+use function is_string;
+use function preg_split;
+use function sprintf;
+use function str_starts_with;
+use function strcasecmp;
+use function strtolower;
+use function substr;
+use const PREG_SPLIT_DELIM_CAPTURE;
+
+/**
+ * Turns attribute targets into service definitions. Serves both sources of targets -
+ * PHPStan's own vendor/attributes.php and the directories listed
+ * in the `attributeServicesDirectories` section - through AttributeTargetsProvider.
+ */
+final class AttributeServicesRegistrar
+{
+
+	/**
+	 * @param array<class-string, string> $interfaceTagMapping tags added to the services implementing the interfaces
+	 * @return list<class-string> the registered classes
+	 */
+	public static function registerServices(ContainerBuilder $builder, AttributeTargetsProvider $targets, ?int $level, array $interfaceTagMapping): array
+	{
+		$registeredClasses = [];
+		$constructorParameters = self::collectConstructorParameters($targets);
+
+		$conditionalTargets = [];
+		foreach ($targets->findTargetClasses(Conditional::class) as $class) {
+			$conditionalTargets[] = [
+				new TargetClass($class->attribute->attribute, $class->name),
+				self::isConditionMet($builder, $class->attribute->if),
+			];
+		}
+
+		foreach (self::findTargetClasses($targets, AutowiredService::class, $conditionalTargets) as [$class, $tagged]) {
+			$attribute = $class->attribute;
+
+			// a single type in `as` becomes the service type like `class: Interface, factory: Implementation` in NEON,
+			// otherwise Nette would autowire the service as the implementation class too
+			$type = is_string($attribute->as) ? $attribute->as : $class->name;
+			$reflection = new ReflectionClass($type);
+
+			$definition = $builder->addDefinition($attribute->name)
+				->setType($type)
+				->setAutowired($attribute->as);
+
+			if ($attribute->factory !== null) {
+				$definition->setFactory(self::createFactory($attribute->factory));
+			} elseif ($type !== $class->name) {
+				$definition->setFactory($class->name);
+			}
+
+			$registeredClasses[] = $class->name;
+			self::processConstructorParameters($builder, $class->name, $definition, $constructorParameters);
+
+			if (!$attribute->autoTag || !$tagged) {
+				continue;
+			}
+
+			foreach ($interfaceTagMapping as $interface => $tag) {
+				if (!$reflection->implementsInterface($interface)) {
+					continue;
+				}
+
+				$definition->addTag($tag);
+			}
+		}
+
+		foreach ($targets->findTargetClasses(NonAutowiredService::class) as $class) {
+			$attribute = $class->attribute;
+
+			$definition = $builder->addDefinition($attribute->name)
+				->setType($class->name)
+				->setAutowired(false);
+
+			if ($attribute->factory !== null) {
+				$definition->setFactory(self::createFactory($attribute->factory));
+			}
+
+			$registeredClasses[] = $class->name;
+			self::processConstructorParameters($builder, $class->name, $definition, $constructorParameters);
+		}
+
+		foreach ($targets->findTargetClasses(GenerateFactory::class) as $class) {
+			$attribute = $class->attribute;
+			$definition = $builder->addFactoryDefinition(null)
+				->setImplement($attribute->interface);
+
+			if ($attribute->resultType !== null) {
+				$definition->getResultDefinition()->setType($attribute->resultType);
+			}
+
+			$resultDefinition = $definition->getResultDefinition();
+			$registeredClasses[] = $class->name;
+			self::processConstructorParameters($builder, $class->name, $resultDefinition, $constructorParameters);
+		}
+
+		if ($level === null) {
+			return $registeredClasses;
+		}
+
+		foreach (self::findTargetClasses($targets, RegisteredRule::class, $conditionalTargets) as [$class, $tagged]) {
+			$attribute = $class->attribute;
+			if ($attribute->level > $level) {
+				continue;
+			}
+
+			$definition = $builder->addDefinition(null)
+				->setFactory($class->name)
+				->setAutowired($class->name);
+			if ($tagged) {
+				$definition->addTag(LazyRegistry::RULE_TAG);
+			}
+
+			$registeredClasses[] = $class->name;
+			self::processConstructorParameters($builder, $class->name, $definition, $constructorParameters);
+		}
+
+		foreach (self::findTargetClasses($targets, RegisteredCollector::class, $conditionalTargets) as [$class, $tagged]) {
+			$attribute = $class->attribute;
+			if ($attribute->level > $level) {
+				continue;
+			}
+
+			$definition = $builder->addDefinition(null)
+				->setFactory($class->name)
+				->setAutowired($class->name);
+			if ($tagged) {
+				$definition->addTag(RegistryFactory::COLLECTOR_TAG);
+			}
+
+			$registeredClasses[] = $class->name;
+			self::processConstructorParameters($builder, $class->name, $definition, $constructorParameters);
+		}
+
+		return $registeredClasses;
+	}
+
+	/**
+	 * @return array<lowercase-string, non-empty-list<TargetMethodParameter<AutowiredParameter>>>
+	 */
+	public static function collectConstructorParameters(AttributeTargetsProvider $targets): array
+	{
+		$constructorParameters = [];
+		foreach ($targets->findTargetMethodParameters(AutowiredParameter::class) as $parameter) {
+			if (strcasecmp($parameter->method, '__construct') !== 0) {
+				continue;
+			}
+			$lowerClass = strtolower($parameter->class);
+			$constructorParameters[$lowerClass] ??= [];
+			$constructorParameters[$lowerClass][] = $parameter;
+		}
+
+		return $constructorParameters;
+	}
+
+	/**
+	 * @template T of object
+	 * @param class-string<T> $attributeClass
+	 * @param list<array{TargetClass<object>, bool}> $conditionalTargets attributes wrapped in #[Conditional] and whether the condition is met
+	 * @return list<array{TargetClass<T>, bool}> targets and whether they get their tags
+	 */
+	private static function findTargetClasses(AttributeTargetsProvider $targetsProvider, string $attributeClass, array $conditionalTargets): array
+	{
+		$targets = [];
+		foreach ($targetsProvider->findTargetClasses($attributeClass) as $target) {
+			$targets[] = [$target, true];
+		}
+		foreach ($conditionalTargets as [$target, $isConditionMet]) {
+			if (!$target->attribute instanceof $attributeClass) {
+				continue;
+			}
+
+			$targets[] = [new TargetClass($target->attribute, $target->name), $isConditionMet];
+		}
+
+		return $targets;
+	}
+
+	/**
+	 * The strings are NEON values like in the conditionalTags config section, so 'not(%foo%)' is supported too.
+	 *
+	 * @param string|non-empty-list<string> $if
+	 */
+	public static function isConditionMet(ContainerBuilder $builder, string|array $if): bool
+	{
+		// a single string is passed on as it is - like in conditionalTags, it can expand to a list of conditions
+		if (is_string($if)) {
+			return ConditionalTagsExtension::isConditionMet(self::expandCondition($builder, $if));
+		}
+
+		$condition = [];
+		foreach ($if as $item) {
+			$condition[] = self::expandCondition($builder, $item);
+		}
+
+		return ConditionalTagsExtension::isConditionMet($condition);
+	}
+
+	private static function expandCondition(ContainerBuilder $builder, string $condition): mixed
+	{
+		$value = Neon::decode($condition);
+		if ($value instanceof Entity) {
+			$value = new Statement($value->value, $value->attributes);
+		}
+
+		return Helpers::expand($value, $builder->parameters, true);
+	}
+
+	/**
+	 * @param class-string $className
+	 * @param array<lowercase-string, non-empty-list<TargetMethodParameter<AutowiredParameter>>> $constructorParameters
+	 */
+	public static function processConstructorParameters(ContainerBuilder $builder, string $className, ServiceDefinition $definition, array $constructorParameters): void
+	{
+		foreach ($constructorParameters[strtolower($className)] ?? [] as $autowiredParameter) {
+			$ref = $autowiredParameter->attribute->ref ?? '%' . Helpers::escape($autowiredParameter->name) . '%';
+			$definition->setArgument($autowiredParameter->name, self::createArgument($builder, $ref));
+		}
+	}
+
+	/**
+	 * '@service::method' calls a method of another service, 'Class::method' a static method.
+	 */
+	private static function createFactory(string $factory): Statement
+	{
+		[$class, $method] = explode('::', $factory, 2);
+
+		return new Statement([str_starts_with($class, '@') ? new Reference(substr($class, 1)) : $class, $method]);
+	}
+
+	/**
+	 * Treats the reference like a NEON service argument: Nette\DI\Helpers::filterArguments() turns
+	 * `Class::CONST`, `::CONST`, `Enum::Case` and `@service` strings into constants and references,
+	 * also inside the value of a referenced parameter. A parameter with such strings is inlined
+	 * like Nette does in NEON, other parameters are looked up at runtime.
+	 *
+	 * @return mixed
+	 */
+	private static function createArgument(ContainerBuilder $builder, string $ref)
+	{
+		$deferred = self::createDeferredParameter($builder, $ref);
+		if (is_string($deferred)) {
+			return Helpers::filterArguments([$deferred])[0];
+		}
+
+		$expanded = Helpers::expand($ref, $builder->parameters);
+		$filtered = Helpers::filterArguments([$expanded])[0];
+
+		return self::isFiltered($expanded, $filtered) ? $filtered : $deferred;
+	}
+
+	private static function isFiltered(mixed $value, mixed $filtered): bool
+	{
+		if (is_string($value)) {
+			return !is_string($filtered);
+		}
+		if (!is_array($value) || !is_array($filtered)) {
+			return false;
+		}
+		foreach ($value as $key => $item) {
+			if (self::isFiltered($item, $filtered[$key])) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Turns a `%foo%` reference into a deferred `$this->getParameter('foo')` lookup instead of reading
+	 * ContainerBuilder::$parameters right now. Extensions registered after this one still rewrite the
+	 * parameters during loadConfiguration() - ValidateExcludePathsExtension unwraps OptionalPath objects
+	 * in `excludePaths` - and a value snapshotted here would keep the pre-rewrite contents.
+	 *
+	 * `%foo.bar%` becomes `$this->getParameter('foo')['bar']` and `%foo%/suffix` becomes a concatenation,
+	 * mirroring how Nette itself compiles references to dynamic parameters.
+	 *
+	 * @return PhpLiteral|string
+	 * @throws ShouldNotHappenException when the reference points at a parameter that does not exist
+	 */
+	private static function createDeferredParameter(ContainerBuilder $builder, string $ref)
+	{
+		$parts = preg_split('#%([\w.-]*)%#', $ref, flags: PREG_SPLIT_DELIM_CAPTURE);
+		if ($parts === false) {
+			throw new ShouldNotHappenException();
+		}
+
+		$dumper = new Dumper();
+		$lookups = [];
+		$pieces = [];
+		$withoutReferences = '';
+		foreach ($parts as $i => $part) {
+			if ($i % 2 === 0) {
+				if ($part !== '') {
+					$pieces[] = $dumper->dump($part);
+					$withoutReferences .= $part;
+				}
+				continue;
+			}
+
+			if ($part === '') {
+				// '%%' is an escaped percent sign
+				$pieces[] = $dumper->dump('%');
+				$withoutReferences .= '%';
+				continue;
+			}
+
+			$keys = explode('.', $part);
+			self::checkParameterExists($builder, $part, $keys);
+
+			$code = $dumper->format('$this->getParameter(?)', $keys[0]);
+			foreach (array_slice($keys, 1) as $key) {
+				$code .= sprintf('[%s]', $dumper->dump($key));
+			}
+
+			$lookups[] = $code;
+			$pieces[] = sprintf('(%s)', $code);
+		}
+
+		if (count($lookups) === 0) {
+			return $withoutReferences;
+		}
+
+		if (count($pieces) === 1) {
+			// the reference is the whole value, no string coercion
+			return ContainerBuilder::literal($lookups[0]);
+		}
+
+		return ContainerBuilder::literal(implode(' . ', $pieces));
+	}
+
+	/**
+	 * The values are resolved at runtime but the keys never change after loadConfiguration(),
+	 * so a typo in a reference is still caught while compiling the container.
+	 *
+	 * @param non-empty-list<string> $keys
+	 * @throws ShouldNotHappenException
+	 */
+	private static function checkParameterExists(ContainerBuilder $builder, string $ref, array $keys): void
+	{
+		$value = $builder->parameters;
+		foreach ($keys as $key) {
+			if (!is_array($value)) {
+				// a dynamic parameter - cannot be traversed while compiling
+				return;
+			}
+			if (!array_key_exists($key, $value)) {
+				throw new ShouldNotHappenException(sprintf("Missing parameter '%s'.", $ref));
+			}
+
+			$value = $value[$key];
+		}
+	}
+
+}

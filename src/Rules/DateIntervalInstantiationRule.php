@@ -1,0 +1,74 @@
+<?php 
+
+namespace PHPStan\Rules;
+return;
+
+use DateInterval;
+use PhpParser\Node;
+use PhpParser\Node\Expr\New_;
+use PHPStan\Analyser\ArgumentsNormalizer;
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\Conditional;
+use PHPStan\DependencyInjection\RegisteredRule;
+use Throwable;
+use function count;
+use function sprintf;
+use function strtolower;
+
+/**
+ * @implements Rule<Node\Expr\New_>
+ */
+#[Conditional(
+	attribute: new RegisteredRule(level: 5),
+	if: '%featureToggles.checkDateIntervalConstructor%',
+)]
+final class DateIntervalInstantiationRule implements Rule
+{
+
+	public function getNodeType(): string
+	{
+		return New_::class;
+	}
+
+	/**
+	 * @param New_ $node
+	 */
+	public function processNode(Node $node, Scope $scope): array
+	{
+		if (!$node->class instanceof Node\Name) {
+			return [];
+		}
+
+		$args = $node->getArgs();
+		if (
+			count($args) === 0
+			|| strtolower((string) $node->class) !== 'dateinterval'
+		) {
+			return [];
+		}
+
+		$arg = ArgumentsNormalizer::getArgByPositionOrName($args, 0, 'duration');
+		if ($arg === null) {
+			return [];
+		}
+
+		$arg = $scope->getType($arg->value);
+		$errors = [];
+
+		foreach ($arg->getConstantStrings() as $constantString) {
+			$dateIntervalString = $constantString->getValue();
+			try {
+				new DateInterval($dateIntervalString);
+			} catch (Throwable $e) {
+				$errors[] = RuleErrorBuilder::message(sprintf(
+					'Instantiating DateInterval with %s produces an error: %s',
+					$dateIntervalString,
+					$e->getMessage(),
+				))->identifier('new.dateInterval')->build();
+			}
+		}
+
+		return $errors;
+	}
+
+}

@@ -1,0 +1,303 @@
+<?php 
+
+namespace PHPStan\Type\Generic;
+return;
+
+use PHPStan\PhpDocParser\Ast\Type\GenericTypeNode;
+use PHPStan\ShouldNotHappenException;
+use PHPStan\TrinaryLogic;
+use PHPStan\Turbo\ShadowedByTurboExtension;
+use PHPStan\Type\BenevolentUnionType;
+use PHPStan\Type\IsSuperTypeOfResult;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\NeverType;
+use PHPStan\Type\Type;
+use function sprintf;
+
+/**
+ * Represents the variance of a template type parameter.
+ *
+ * Variance describes how subtyping of a generic type relates to subtyping of its
+ * type arguments. For a class `Box<T>`:
+ *
+ * - **Invariant** (default): `Box<Cat>` is NOT a subtype of `Box<Animal>`, even though
+ *   Cat extends Animal. The type argument must match exactly. Declared with `@template T`.
+ * - **Covariant**: `Box<Cat>` IS a subtype of `Box<Animal>`. Safe when T only appears
+ *   in "output" positions (return types). Declared with `@template-covariant T`.
+ * - **Contravariant**: `Box<Animal>` IS a subtype of `Box<Cat>`. Safe when T only
+ *   appears in "input" positions (parameter types). Declared with `@template-contravariant T`.
+ * - **Bivariant**: The type argument is ignored for subtyping purposes. Rarely used.
+ * - **Static**: Special variance for `static` return type in template context.
+ *
+ * Variance composition follows standard rules — e.g. covariant composed with
+ * contravariant yields contravariant. This is used when template types appear
+ * inside nested generic types.
+ *
+ * @api
+ */
+#[ShadowedByTurboExtension(implementation: __DIR__ . '/../../../turbo-ext/src/TemplateTypeVariance.cpp')]
+final class TemplateTypeVariance
+{
+
+	private const INVARIANT = 1;
+	private const COVARIANT = 2;
+	private const CONTRAVARIANT = 3;
+	private const STATIC = 4;
+	private const BIVARIANT = 5;
+
+	/** @var self[] */
+	private static array $registry;
+
+	private function __construct(private int $value)
+	{
+	}
+
+	private static function create(int $value): self
+	{
+		self::$registry[$value] ??= new self($value);
+		return self::$registry[$value];
+	}
+
+	/** Type argument must match exactly. This is the default for @template T. */
+	public static function createInvariant(): self
+	{
+		return self::create(self::INVARIANT);
+	}
+
+	/** Subtyping flows with the type argument: Cat <: Animal ⟹ Box<Cat> <: Box<Animal>. */
+	public static function createCovariant(): self
+	{
+		return self::create(self::COVARIANT);
+	}
+
+	/** Subtyping flows against the type argument: Cat <: Animal ⟹ Box<Animal> <: Box<Cat>. */
+	public static function createContravariant(): self
+	{
+		return self::create(self::CONTRAVARIANT);
+	}
+
+	/** Special variance for static return type in template context. */
+	public static function createStatic(): self
+	{
+		return self::create(self::STATIC);
+	}
+
+	/** Type argument is ignored for subtyping — all types are compatible. */
+	public static function createBivariant(): self
+	{
+		return self::create(self::BIVARIANT);
+	}
+
+	public function invariant(): bool
+	{
+		return $this->value === self::INVARIANT;
+	}
+
+	public function covariant(): bool
+	{
+		return $this->value === self::COVARIANT;
+	}
+
+	public function contravariant(): bool
+	{
+		return $this->value === self::CONTRAVARIANT;
+	}
+
+	public function static(): bool
+	{
+		return $this->value === self::STATIC;
+	}
+
+	public function bivariant(): bool
+	{
+		return $this->value === self::BIVARIANT;
+	}
+
+	public function compose(self $other): self
+	{
+		if ($this->contravariant()) {
+			if ($other->contravariant()) {
+				return self::createCovariant();
+			}
+			if ($other->covariant()) {
+				return self::createContravariant();
+			}
+			if ($other->bivariant()) {
+				return self::createBivariant();
+			}
+			return self::createInvariant();
+		}
+
+		if ($this->covariant()) {
+			if ($other->contravariant()) {
+				return self::createContravariant();
+			}
+			if ($other->covariant()) {
+				return self::createCovariant();
+			}
+			if ($other->bivariant()) {
+				return self::createBivariant();
+			}
+			return self::createInvariant();
+		}
+
+		if ($this->invariant()) {
+			return self::createInvariant();
+		}
+
+		if ($this->bivariant()) {
+			return self::createBivariant();
+		}
+
+		return $other;
+	}
+
+	/**
+	 * By default `mixed` and benevolent unions are compatible with any other type
+	 * argument in both directions - that is how gradual typing works.
+	 *
+	 * With $strict that answer is not given: it makes the relation symmetric
+	 * (`Foo<mixed>` and `Foo<int>` end up supertypes of each other) and
+	 * TypeCombinator::union() then discards one of them depending on the order the
+	 * types come in. In the strict mode invariance is relaxed just enough to keep
+	 * `Foo<mixed>` a supertype of `Foo<int>` and not the other way around.
+	 */
+	public function isValidVariance(TemplateType $templateType, Type $a, Type $b, bool $strict = false): IsSuperTypeOfResult
+	{
+		if ($b instanceof NeverType) {
+			return IsSuperTypeOfResult::createYes();
+		}
+
+		if (!$strict) {
+			if ($a instanceof MixedType && !$a instanceof TemplateType) {
+				return IsSuperTypeOfResult::createYes();
+			}
+
+			if ($a instanceof BenevolentUnionType) {
+				if (!$a->isSuperTypeOf($b)->no()) {
+					return IsSuperTypeOfResult::createYes();
+				}
+			}
+
+			if ($b instanceof BenevolentUnionType) {
+				if (!$b->isSuperTypeOf($a)->no()) {
+					return IsSuperTypeOfResult::createYes();
+				}
+			}
+
+			if ($b instanceof MixedType && !$b instanceof TemplateType) {
+				return IsSuperTypeOfResult::createYes();
+			}
+		}
+
+		if ($this->invariant()) {
+			if ($a instanceof TemplateType && $b instanceof TemplateType
+				&& $a->getScope()->equals($b->getScope())
+				&& $a->getName() === $b->getName()
+			) {
+				return IsSuperTypeOfResult::createYes();
+			}
+
+			if ($strict) {
+				if ($a instanceof MixedType && !$a instanceof TemplateType) {
+					return IsSuperTypeOfResult::createYes();
+				}
+
+				if ($a instanceof BenevolentUnionType && !$a->isSuperTypeOf($b)->no()) {
+					return IsSuperTypeOfResult::createYes();
+				}
+
+				if ($b instanceof BenevolentUnionType && !$b->isSuperTypeOf($a)->no()) {
+					return IsSuperTypeOfResult::createMaybe();
+				}
+
+				if ($b instanceof MixedType && !$b instanceof TemplateType) {
+					return IsSuperTypeOfResult::createMaybe();
+				}
+			}
+
+			$result = $a->equals($b);
+			$reasons = [];
+			if (!$result) {
+				if (
+					$templateType->getScope()->getClassName() !== null
+					&& $a->isSuperTypeOf($b)->yes()
+				) {
+					$reasons[] = sprintf(
+						'Template type %s on class %s is not covariant. Learn more: <fg=cyan>https://phpstan.org/blog/whats-up-with-template-covariant</>',
+						$templateType->getName(),
+						$templateType->getScope()->getClassName(),
+					);
+				}
+			}
+
+			return new IsSuperTypeOfResult(TrinaryLogic::createFromBoolean($result), $reasons);
+		}
+
+		if ($this->covariant() || $this->contravariant()) {
+			// The "exactly this class" flavour of a `new Foo()` value cannot be written
+			// in a PHPDoc type argument - ignore it like equals() does for invariance.
+			$a = TemplateTypeHelper::removeFinalByKeywordOverrides($a);
+			$b = TemplateTypeHelper::removeFinalByKeywordOverrides($b);
+
+			return $this->covariant() ? $a->isSuperTypeOf($b) : $b->isSuperTypeOf($a);
+		}
+
+		if ($this->bivariant()) {
+			return IsSuperTypeOfResult::createYes();
+		}
+
+		throw new ShouldNotHappenException();
+	}
+
+	public function equals(self $other): bool
+	{
+		return $other->value === $this->value;
+	}
+
+	public function validPosition(self $other): bool
+	{
+		return $other->value === $this->value
+			|| $other->invariant()
+			|| $this->bivariant()
+			|| $this->static();
+	}
+
+	public function describe(): string
+	{
+		switch ($this->value) {
+			case self::INVARIANT:
+				return 'invariant';
+			case self::COVARIANT:
+				return 'covariant';
+			case self::CONTRAVARIANT:
+				return 'contravariant';
+			case self::STATIC:
+				return 'static';
+			case self::BIVARIANT:
+				return 'bivariant';
+		}
+
+		throw new ShouldNotHappenException();
+	}
+
+	/**
+	 * @return GenericTypeNode::VARIANCE_*
+	 */
+	public function toPhpDocNodeVariance(): string
+	{
+		switch ($this->value) {
+			case self::INVARIANT:
+				return GenericTypeNode::VARIANCE_INVARIANT;
+			case self::COVARIANT:
+				return GenericTypeNode::VARIANCE_COVARIANT;
+			case self::CONTRAVARIANT:
+				return GenericTypeNode::VARIANCE_CONTRAVARIANT;
+			case self::BIVARIANT:
+				return GenericTypeNode::VARIANCE_BIVARIANT;
+		}
+
+		throw new ShouldNotHappenException();
+	}
+
+}
